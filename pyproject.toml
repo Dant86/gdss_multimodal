@@ -1,0 +1,36 @@
+[project]
+name = "gdss-multimodal"
+version = "0.1.0"
+description = "Joint ECG–text diffusion via generalised S4 symmetric splitting"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.4.0",
+    "einops",
+    "transformers==4.44.2",
+    "huggingface_hub>=0.22.0",
+    "accelerate>=0.29.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "pandas>=2.0.0",
+    "wfdb>=4.1.0",
+    "modal",
+]
+
+# momentfm pins old transformers/huggingface_hub; install without its deps:
+#   uv pip install momentfm --no-deps
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "W"]
+ignore = ["N999"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "data", "models", "sde", "solvers"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingImports = false

@@ -1,0 +1,38 @@
+# runtime artifacts
+tmp/
+cache/
+checkpoints/
+samples/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# environments
+.venv/
+venv/
+.env
+
+# tools
+.ruff_cache/
+.pyright/
+.mypy_cache/
+.pytest_cache/
+
+# editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Modal
+.modal.toml
