@@ -80,7 +80,10 @@ def _langevin_step(
     B = x.shape[0]
     x_norm = x.view(B, -1).norm(dim=1)
     s_norm = score.view(B, -1).norm(dim=1).clamp(min=1e-8)
-    eps = ((snr * x_norm / s_norm) ** 2).view((-1,) + (1,) * (x.dim() - 1))
+    # Clamp at 1.0 to prevent blow-up when score is small relative to x
+    # (common early in training or at large t where score norms are weak).
+    eps = ((snr * x_norm / s_norm) ** 2).clamp(max=1.0)
+    eps = eps.view((-1,) + (1,) * (x.dim() - 1))
     return x + eps * score + (2 * eps).sqrt() * torch.randn_like(x)
 
 

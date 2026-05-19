@@ -59,6 +59,6 @@ def unzip_ptbxl() -> None:
     modal_common.cache_vol.commit()
 
 
-@modal_common.app.local_entrypoint()
+@modal_common.app.local_entrypoint(name="download")
 def main() -> None:
     unzip_ptbxl.remote()

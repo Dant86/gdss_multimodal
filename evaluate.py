@@ -119,9 +119,10 @@ def extract_moment_features(ecgs, device, batch_size: int = 32):
     with torch.no_grad():
         for i in range(0, len(ecgs), batch_size):
             x = torch.from_numpy(ecgs[i: i + batch_size]).to(device)
-            out = moment(x)
-            emb = out.embeddings if hasattr(out, "embeddings") else out
-            feats.append(emb.mean(dim=1).cpu().numpy())
+            inner = moment.model if hasattr(moment, "model") else moment
+            mask = torch.ones(x.shape[0], x.shape[-1], device=device, dtype=torch.long)
+            out = inner.embed(x_enc=x, input_mask=mask, reduction="mean")
+            feats.append(out.embeddings.cpu().numpy())  # (B, d_model) — already pooled
     return numpy.concatenate(feats)
 
 
@@ -141,13 +142,16 @@ def ecg_fid(real_ecgs, gen_ecgs, device) -> float:
 
     def _fid(m1, s1, m2, s2):
         diff = m1 - m2
-        cov, _ = scipy.linalg.sqrtm(s1 @ s2, disp=False)
+        eps = numpy.eye(s1.shape[0]) * 1e-6
+        cov, _ = scipy.linalg.sqrtm((s1 + eps) @ (s2 + eps), disp=False)
         if numpy.iscomplexobj(cov):
             cov = cov.real
         return float(diff @ diff + numpy.trace(s1 + s2 - 2 * cov))
 
     rf = extract_moment_features(real_ecgs, device)
     gf = extract_moment_features(gen_ecgs, device)
+    rf = rf.reshape(len(rf), -1)
+    gf = gf.reshape(len(gf), -1)
     return _fid(rf.mean(0), numpy.cov(rf, rowvar=False), gf.mean(0), numpy.cov(gf, rowvar=False))
 
 
@@ -289,7 +293,7 @@ def eval_one_cell(sampler_name, nfe, checkpoint, n_samples, corrector_snr):
     return sampler_name, nfe, metrics
 
 
-@modal_common.app.local_entrypoint()
+@modal_common.app.local_entrypoint(name="evaluate")
 def main(
     checkpoint: str = "final",
     n_samples: int = 1000,

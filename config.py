@@ -1,6 +1,5 @@
 """Dataclass configs for all hyperparameters."""
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -12,33 +11,23 @@ class SDEConfig:
 
 
 @dataclass
-class MOMENTConfig:
-    # Number of transformer layers to freeze (first half); rest are fine-tuned
-    freeze_first_n: Optional[int] = None  # None = auto (half of total layers)
-    # Sinusoidal noise-level embedding dim
-    timestep_embed_dim: int = 256
-    # FiLM MLP hidden dim (2-layer MLP: timestep_embed_dim -> film_hidden -> 2*d_model)
-    film_hidden_dim: int = 512
-    # MOMENT's hidden dim for MOMENT-1-large
-    moment_hidden_dim: int = 1024
-
-
-@dataclass
 class ECGScoreConfig:
-    moment: MOMENTConfig = field(default_factory=MOMENTConfig)
     # Text embedding dim (BioClinicalBERT CLS token)
     text_dim: int = 768
-    # Score head hidden dim
-    score_head_hidden: int = 512
     # ECG shape
     n_leads: int = 1
     seq_len: int = 1000
+    # U-Net architecture
+    timestep_dim: int = 128
+    channels: tuple = (32, 64, 128)
+    bottleneck_ch: int = 256
 
 
 @dataclass
 class TextScoreConfig:
     text_dim: int = 768
-    moment_hidden_dim: int = 1024
+    # Must match ECGScoreConfig.bottleneck_ch
+    moment_hidden_dim: int = 256
     timestep_embed_dim: int = 256
     hidden_dim: int = 512
     n_layers: int = 4
@@ -60,8 +49,8 @@ class TrainConfig:
     # Loss
     likelihood_weighting: bool = True  # λ(t) = σ(t)²
     # Logging
-    log_every: int = 10
-    val_every: int = 2000
+    log_every: int = 500
+    val_every: int = 500
     save_every: int = 5000
     checkpoint_dir: str = "checkpoints"
     # Device

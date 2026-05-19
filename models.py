@@ -3,14 +3,13 @@
 Classes:
     FiLM: Feature-wise Linear Modulation conditioning layer.
     SinusoidalTimestepEmbed: Sinusoidal embedding for continuous timesteps.
-    ECGScoreNet: s_θ — ECG score network backed by MOMENT-1-large.
+    ECGUNet: s_θ — ECG score network; small 1D U-Net with FiLM conditioning.
     TextScoreNet: s_φ — text score MLP with cross-modal FiLM conditioning.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -89,126 +88,146 @@ class SinusoidalTimestepEmbed(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
-class ECGScoreNet(nn.Module):
+class _ResBlock1D(nn.Module):
+    """GroupNorm → Conv1d → FiLM → GroupNorm → Conv1d with residual."""
+
+    def __init__(self, channels: int, cond_dim: int) -> None:
+        super().__init__()
+        groups = min(8, channels)
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = nn.Conv1d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.conv2 = nn.Conv1d(channels, channels, 3, padding=1)
+        self.film = FiLM(cond_dim, channels, hidden_dim=max(64, channels))
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(self.act(self.norm1(x)))
+        # FiLM expects (..., C); transpose (B, C, L) → (B, L, C) and back
+        h = self.film(h.transpose(1, 2), cond).transpose(1, 2)
+        h = self.conv2(self.act(self.norm2(h)))
+        return x + h
+
+
+class _Down1D(nn.Module):
+    """Stride-2 Conv1d followed by a residual block."""
+
+    def __init__(self, in_ch: int, out_ch: int, cond_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Conv1d(in_ch, out_ch, 4, stride=2, padding=1)
+        self.res = _ResBlock1D(out_ch, cond_dim)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        return self.res(self.proj(x), cond)
+
+
+class _Up1D(nn.Module):
+    """ConvTranspose1d upsample, merge skip via 1×1 conv, residual block."""
+
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, cond_dim: int) -> None:
+        super().__init__()
+        self.up = nn.ConvTranspose1d(in_ch, out_ch, 4, stride=2, padding=1)
+        self.merge = nn.Conv1d(out_ch + skip_ch, out_ch, 1)
+        self.res = _ResBlock1D(out_ch, cond_dim)
+
+    def forward(
+        self, x: torch.Tensor, skip: torch.Tensor, cond: torch.Tensor
+    ) -> torch.Tensor:
+        x = self.up(x)
+        if x.shape[-1] != skip.shape[-1]:
+            x = x[..., : skip.shape[-1]]
+        h = self.merge(torch.cat([x, skip], dim=1))
+        return self.res(h, cond)
+
+
+class ECGUNet(nn.Module):
     """s_θ(M1_t, M2_t, t) — ECG score network.
 
-    Architecture:
-        1. MOMENT-1-large backbone (first half frozen, second half fine-tuned).
-           Gradient checkpointing is disabled so gradients flow correctly
-           across the frozen/unfrozen boundary.
-        2. FiLM noise conditioning on the pooled MOMENT output.
-        3. Cross-modal FiLM conditioning on the noisy text embedding.
-        4. Score head: 2-layer MLP projecting to (B, n_leads, seq_len).
+    Small 1D U-Net with strided convolutions and FiLM conditioning.
+    Skip connections preserve spatial resolution through the score function,
+    avoiding the bottleneck-then-expand issue of a pooled backbone approach.
+
+    Conditioning signal: sinusoidal timestep embedding concatenated with a
+    linear projection of the noisy text embedding → all U-Net residual blocks
+    receive (time, text) jointly via FiLM.
 
     Args:
         text_dim: Text embedding dimensionality (768 for BioClinicalBERT).
-        moment_hidden: MOMENT-1-large hidden dimensionality (1024).
-        timestep_dim: Sinusoidal timestep embedding dimensionality.
-        film_hidden: Hidden width of FiLM MLPs.
-        score_head_hidden: Hidden width of the score head MLP.
-        n_leads: Number of ECG leads to generate.
+        n_leads: Number of ECG leads.
         seq_len: Number of time steps per lead.
-        freeze_first_n: Number of MOMENT transformer blocks to freeze.
-            Defaults to half of all blocks when None.
+        timestep_dim: Sinusoidal timestep embedding dimensionality.
+        channels: Channel widths for each encoder level (length = n_levels).
+        bottleneck_ch: Channel width of the U-Net bottleneck.
     """
 
     def __init__(
         self,
         text_dim: int = 768,
-        moment_hidden: int = 1024,
-        timestep_dim: int = 256,
-        film_hidden: int = 512,
-        score_head_hidden: int = 512,
-        n_leads: int = 12,
-        seq_len: int = 5000,
-        freeze_first_n: Optional[int] = None,
+        n_leads: int = 1,
+        seq_len: int = 1000,
+        timestep_dim: int = 128,
+        channels: tuple = (32, 64, 128),
+        bottleneck_ch: int = 256,
     ) -> None:
         super().__init__()
         self.n_leads = n_leads
         self.seq_len = seq_len
+        self.bottleneck_ch = bottleneck_ch
+        self._text_proj_dim = timestep_dim
 
         self.t_embed = SinusoidalTimestepEmbed(timestep_dim)
-        self.moment = self._load_moment()
-        self._freeze_moment(freeze_first_n)
+        self.text_proj = nn.Linear(text_dim, timestep_dim)
+        cond_dim = timestep_dim * 2
 
-        self.t_film = FiLM(timestep_dim, moment_hidden, film_hidden)
-        self.text_proj = nn.Linear(text_dim, moment_hidden)
-        self.cross_film = FiLM(moment_hidden, moment_hidden, film_hidden)
+        self.input_conv = nn.Conv1d(n_leads, channels[0], 3, padding=1)
+        self.input_res = _ResBlock1D(channels[0], cond_dim)
 
-        self.score_head = nn.Sequential(
-            nn.Linear(moment_hidden, score_head_hidden),
-            nn.SiLU(),
-            nn.Linear(score_head_hidden, n_leads * seq_len),
-        )
+        ch_list = list(channels)
+        self.downs = nn.ModuleList()
+        for i in range(len(ch_list) - 1):
+            self.downs.append(_Down1D(ch_list[i], ch_list[i + 1], cond_dim))
+        self.downs.append(_Down1D(ch_list[-1], bottleneck_ch, cond_dim))
 
-    def _load_moment(self) -> nn.Module:
-        import momentfm  # noqa: PLC0415
+        self.mid = _ResBlock1D(bottleneck_ch, cond_dim)
 
-        return momentfm.MOMENTPipeline.from_pretrained(
-            "AutonLab/MOMENT-1-large",
-            model_kwargs={"task_name": "embedding"},
-        )
+        self.ups = nn.ModuleList()
+        # First up: bottleneck → last channel
+        self.ups.append(_Up1D(bottleneck_ch, ch_list[-1], ch_list[-1], cond_dim))
+        for i in range(len(ch_list) - 1, 0, -1):
+            self.ups.append(_Up1D(ch_list[i], ch_list[i - 1], ch_list[i - 1], cond_dim))
 
-    def _freeze_moment(self, freeze_first_n: Optional[int]) -> None:
-        """Freeze patch/pos embeddings and the first N transformer blocks.
+        self.output_norm = nn.GroupNorm(min(8, channels[0]), channels[0])
+        self.output_conv = nn.Conv1d(channels[0], n_leads, 1)
 
-        Args:
-            freeze_first_n: Number of blocks to freeze. Defaults to half.
-        """
-        for name, param in self.moment.named_parameters():
-            if any(k in name for k in (
-                "patch_embed", "pos_embed", "cls_token",
-                "patch_embedding", "positional_encoding",
-            )):
-                param.requires_grad_(False)
+    def _cond(self, t_emb: torch.Tensor, text_t: torch.Tensor) -> torch.Tensor:
+        return torch.cat([t_emb, nn.functional.silu(self.text_proj(text_t))], dim=-1)
 
-        blocks = [
-            m for m in self.moment.modules()
-            if m.__class__.__name__ in (
-                "Block", "BertLayer", "TransformerLayer", "EncoderLayer"
-            )
-        ]
-        n_freeze = freeze_first_n if freeze_first_n is not None else len(blocks) // 2
-        for block in blocks[:n_freeze]:
-            for param in block.parameters():
-                param.requires_grad_(False)
+    def _encode(self, ecg_t: torch.Tensor, cond: torch.Tensor) -> tuple:
+        """Run encoder, return (bottleneck, list_of_skips)."""
+        h = self.input_res(self.input_conv(ecg_t), cond)
+        skips = [h]
+        for down in self.downs[:-1]:
+            h = down(h, cond)
+            skips.append(h)
+        h = self.downs[-1](h, cond)
+        h = self.mid(h, cond)
+        return h, skips
 
-        inner = self.moment.model if hasattr(self.moment, "model") else self.moment
-        if hasattr(inner, "config"):
-            inner.config.gradient_checkpointing = False
-        for m in inner.modules():
-            if hasattr(m, "gradient_checkpointing"):
-                m.gradient_checkpointing = False
-
-    def _moment_encode(self, ecg: torch.Tensor) -> torch.Tensor:
-        """Run MOMENT embed and return mean-pooled representation.
+    def encode(self, ecg_t: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        """Mean-pool bottleneck for cross-modal text conditioning.
 
         Args:
-            ecg: ECG waveform of shape (B, n_leads, seq_len).
-
-        Returns:
-            Pooled embedding of shape (B, moment_hidden).
-        """
-        B = ecg.shape[0]
-        mask = torch.ones(B, ecg.shape[-1], device=ecg.device, dtype=torch.long)
-        inner = self.moment.model if hasattr(self.moment, "model") else self.moment
-        out = inner.embed(x_enc=ecg, input_mask=mask, reduction="mean")
-        return out.embeddings
-
-    def _moment_forward_with_film(
-        self, ecg: torch.Tensor, t_emb: torch.Tensor
-    ) -> torch.Tensor:
-        """Extract timestep-conditioned ECG representation for cross-modal use.
-
-        Args:
-            ecg: Noisy ECG waveform of shape (B, n_leads, seq_len).
+            ecg_t: Noisy ECG of shape (B, n_leads, seq_len).
             t_emb: Timestep embedding of shape (B, timestep_dim).
 
         Returns:
-            Conditioned representation of shape (B, moment_hidden).
+            Pooled bottleneck of shape (B, bottleneck_ch).
         """
-        h = self._moment_encode(ecg)
-        return self.t_film(h, t_emb)
+        B = ecg_t.shape[0]
+        text_zero = torch.zeros(B, self._text_proj_dim, device=ecg_t.device)
+        cond = torch.cat([t_emb, text_zero], dim=-1)
+        h, _ = self._encode(ecg_t, cond)
+        return h.mean(dim=-1)
 
     def forward(
         self, ecg_t: torch.Tensor, text_t: torch.Tensor, t: torch.Tensor
@@ -224,10 +243,13 @@ class ECGScoreNet(nn.Module):
             Score estimate of shape (B, n_leads, seq_len).
         """
         t_emb = self.t_embed(t)
-        h = self._moment_forward_with_film(ecg_t, t_emb)
-        text_cond = self.text_proj(text_t)
-        h = self.cross_film(h, text_cond)
-        return self.score_head(h).view(-1, self.n_leads, self.seq_len)
+        cond = self._cond(t_emb, text_t)
+        h, skips = self._encode(ecg_t, cond)
+        h = self.ups[0](h, skips[-1], cond)
+        for i, up in enumerate(self.ups[1:]):
+            h = up(h, skips[-(i + 2)], cond)
+        h = nn.functional.silu(self.output_norm(h))
+        return self.output_conv(h)
 
 
 class TextScoreNet(nn.Module):
@@ -238,7 +260,7 @@ class TextScoreNet(nn.Module):
 
     Args:
         text_dim: Text embedding dimensionality (768).
-        moment_hidden: ECG mean-pooled representation dimensionality (1024).
+        moment_hidden: ECG bottleneck dimensionality (matches ECGUNet.bottleneck_ch).
         timestep_dim: Sinusoidal timestep embedding dimensionality.
         hidden_dim: MLP hidden width.
         n_layers: Number of residual MLP layers.
@@ -247,7 +269,7 @@ class TextScoreNet(nn.Module):
     def __init__(
         self,
         text_dim: int = 768,
-        moment_hidden: int = 1024,
+        moment_hidden: int = 256,
         timestep_dim: int = 256,
         hidden_dim: int = 512,
         n_layers: int = 4,
@@ -273,7 +295,7 @@ class TextScoreNet(nn.Module):
 
         Args:
             text_t: Noisy text embedding of shape (B, text_dim).
-            ecg_rep: Mean-pooled ECG representation of shape (B, moment_hidden).
+            ecg_rep: Mean-pooled ECG bottleneck of shape (B, moment_hidden).
             t: Timesteps of shape (B,).
 
         Returns:

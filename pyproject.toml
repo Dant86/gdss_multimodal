@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Joint ECG–text diffusion via generalised S4 symmetric splitting"
 requires-python = ">=3.11"
 dependencies = [
-    "torch==2.4.0",
+    "torch>=2.1.0",   # Modal container overrides this with torch==2.4.0+cu121
     "einops",
     "transformers==4.44.2",
     "huggingface_hub>=0.22.0",
@@ -16,8 +16,14 @@ dependencies = [
     "modal",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 # momentfm pins old transformers/huggingface_hub; install without its deps:
 #   uv pip install momentfm --no-deps
+
+[tool.pytest.ini_options]
+testpaths = ["tests.py"]
 
 [tool.ruff]
 line-length = 100

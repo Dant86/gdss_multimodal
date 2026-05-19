@@ -28,14 +28,13 @@ def load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device):
 
     import models as models_module
 
-    s_theta = models_module.ECGScoreNet(
+    s_theta = models_module.ECGUNet(
         text_dim=cfg.ecg_score.text_dim,
-        moment_hidden=cfg.ecg_score.moment.moment_hidden_dim,
-        timestep_dim=cfg.ecg_score.moment.timestep_embed_dim,
-        film_hidden=cfg.ecg_score.moment.film_hidden_dim,
-        score_head_hidden=cfg.ecg_score.score_head_hidden,
         n_leads=cfg.ecg_score.n_leads,
         seq_len=cfg.ecg_score.seq_len,
+        timestep_dim=cfg.ecg_score.timestep_dim,
+        channels=cfg.ecg_score.channels,
+        bottleneck_ch=cfg.ecg_score.bottleneck_ch,
     ).to(device)
     s_phi = models_module.TextScoreNet(
         text_dim=cfg.text_score.text_dim,
@@ -83,7 +82,7 @@ def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps
         return s_theta(m1, m2, t)
 
     def score_text(m2, m1, t):
-        h = s_theta._moment_forward_with_film(m1, s_theta.t_embed(t))
+        h = s_theta.encode(m1, s_theta.t_embed(t))
         return s_phi(m2, h, t)
 
     generated = 0
@@ -152,7 +151,7 @@ def sample_on_modal(
     modal_common.samples_vol.commit()
 
 
-@modal_common.app.local_entrypoint()
+@modal_common.app.local_entrypoint(name="sample")
 def main(
     checkpoint: str = "final",
     sampler: str = "s4",

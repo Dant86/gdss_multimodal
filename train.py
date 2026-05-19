@@ -60,7 +60,7 @@ def _ecg_rep(s_theta, ecg_t, text_t, t):
     import torch
 
     with torch.no_grad():
-        h = s_theta._moment_forward_with_film(ecg_t, s_theta.t_embed(t))
+        h = s_theta.encode(ecg_t, s_theta.t_embed(t))
     return h.detach()
 
 
@@ -107,15 +107,13 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
     )
 
     print("Building models…")
-    s_theta = models_module.ECGScoreNet(
+    s_theta = models_module.ECGUNet(
         text_dim=cfg.ecg_score.text_dim,
-        moment_hidden=cfg.ecg_score.moment.moment_hidden_dim,
-        timestep_dim=cfg.ecg_score.moment.timestep_embed_dim,
-        film_hidden=cfg.ecg_score.moment.film_hidden_dim,
-        score_head_hidden=cfg.ecg_score.score_head_hidden,
         n_leads=cfg.ecg_score.n_leads,
         seq_len=cfg.ecg_score.seq_len,
-        freeze_first_n=cfg.ecg_score.moment.freeze_first_n,
+        timestep_dim=cfg.ecg_score.timestep_dim,
+        channels=cfg.ecg_score.channels,
+        bottleneck_ch=cfg.ecg_score.bottleneck_ch,
     ).to(device)
     s_phi = models_module.TextScoreNet(
         text_dim=cfg.text_score.text_dim,
@@ -164,16 +162,10 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
         raw = loss.item()
         loss_ema = raw if loss_ema is None else 0.98 * loss_ema + 0.02 * raw
 
-        if step % cfg.train.log_every == 0:
-            elapsed = time.time() - t0
-            sps = step / elapsed if elapsed > 0 else 0
-            print(
-                f"step {step:6d} | loss {raw:.4f} | ema {loss_ema:.4f}"
-                f" | lr {scheduler.get_last_lr()[0]:.2e}"
-                f" | {sps:.2f} steps/s | {elapsed / 60:.1f} min elapsed"
-            )
         if step % cfg.train.val_every == 0:
-            print(f"  val_loss {_validate(s_theta, s_phi, val_loader, vpsde, device, cfg):.4f}")
+            elapsed = time.time() - t0
+            val_loss = _validate(s_theta, s_phi, val_loader, vpsde, device, cfg)
+            print(f"step {step:6d} | val {val_loss:.4f} | ema {loss_ema:.4f} | {elapsed / 60:.1f} min")
         if step % cfg.train.save_every == 0:
             _save(s_theta, s_phi, optimiser, step, ckpt_dir)
             if on_checkpoint:
@@ -266,7 +258,7 @@ def train_on_modal(max_steps=100_000, batch_size=128, lr=2e-4):
     modal_common.cache_vol.commit()
 
 
-@modal_common.app.local_entrypoint()
+@modal_common.app.local_entrypoint(name="train")
 def main(max_steps: int = 100_000, batch_size: int = 128, lr: float = 2e-4):
     train_on_modal.remote(max_steps=max_steps, batch_size=batch_size, lr=lr)
 
