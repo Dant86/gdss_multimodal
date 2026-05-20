@@ -88,6 +88,40 @@ class SinusoidalTimestepEmbed(nn.Module):
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
 
+class _SelfAttention1D(nn.Module):
+    """Multi-head self-attention along the time axis with residual connection.
+
+    Applied at the U-Net bottleneck so the model can reason about long-range
+    periodicity (e.g. R-R intervals spanning ~75 samples at 75 bpm).
+
+    Args:
+        channels: Channel width (= embed dim for attention).
+        n_heads: Number of attention heads. Must divide channels.
+    """
+
+    def __init__(self, channels: int, n_heads: int = 8, zero_init_output: bool = False) -> None:
+        super().__init__()
+        self.norm = nn.GroupNorm(min(8, channels), channels)
+        self.attn = nn.MultiheadAttention(channels, n_heads, batch_first=True)
+        if zero_init_output:
+            # Zero-init output projection → identity at init, preserving pretrained features
+            nn.init.zeros_(self.attn.out_proj.weight)
+            nn.init.zeros_(self.attn.out_proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Self-attend over time.
+
+        Args:
+            x: Feature map of shape (B, C, L).
+
+        Returns:
+            Attended tensor of the same shape.
+        """
+        h = self.norm(x).transpose(1, 2)      # (B, L, C)
+        h, _ = self.attn(h, h, h, need_weights=False)
+        return x + h.transpose(1, 2)          # (B, C, L)
+
+
 class _ResBlock1D(nn.Module):
     """GroupNorm → Conv1d → FiLM → GroupNorm → Conv1d with residual."""
 
@@ -168,6 +202,7 @@ class ECGUNet(nn.Module):
         timestep_dim: int = 128,
         channels: tuple = (32, 64, 128),
         bottleneck_ch: int = 256,
+        lead_emb_dim: int = 64,
     ) -> None:
         super().__init__()
         self.n_leads = n_leads
@@ -177,7 +212,17 @@ class ECGUNet(nn.Module):
 
         self.t_embed = SinusoidalTimestepEmbed(timestep_dim)
         self.text_proj = nn.Linear(text_dim, timestep_dim)
-        cond_dim = timestep_dim * 2
+
+        # Lead identity conditioning: embed lead index (0–11) → timestep_dim
+        # so the model sees which lead it is processing via every FiLM layer.
+        # Setting lead_emb_dim=0 disables this (single-lead / no-conditioning mode).
+        self._lead_emb_dim = lead_emb_dim
+        if lead_emb_dim > 0:
+            self.lead_embed = nn.Embedding(12, lead_emb_dim)
+            self.lead_proj = nn.Linear(lead_emb_dim, timestep_dim)
+            cond_dim = timestep_dim * 3   # time | text | lead
+        else:
+            cond_dim = timestep_dim * 2   # time | text
 
         self.input_conv = nn.Conv1d(n_leads, channels[0], 3, padding=1)
         self.input_res = _ResBlock1D(channels[0], cond_dim)
@@ -188,7 +233,11 @@ class ECGUNet(nn.Module):
             self.downs.append(_Down1D(ch_list[i], ch_list[i + 1], cond_dim))
         self.downs.append(_Down1D(ch_list[-1], bottleneck_ch, cond_dim))
 
+        # Stride-4 attention: length = seq_len/4, sees ~2 cardiac cycles at 75 bpm.
+        # Zero-init output so it's identity at init, preserving pretrained features.
+        self.encoder_attn = _SelfAttention1D(ch_list[-1], n_heads=8, zero_init_output=True)
         self.mid = _ResBlock1D(bottleneck_ch, cond_dim)
+        self.bottleneck_attn = _SelfAttention1D(bottleneck_ch, n_heads=8)
 
         self.ups = nn.ModuleList()
         # First up: bottleneck → last channel
@@ -199,8 +248,22 @@ class ECGUNet(nn.Module):
         self.output_norm = nn.GroupNorm(min(8, channels[0]), channels[0])
         self.output_conv = nn.Conv1d(channels[0], n_leads, 1)
 
-    def _cond(self, t_emb: torch.Tensor, text_t: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t_emb, nn.functional.silu(self.text_proj(text_t))], dim=-1)
+    def _cond(
+        self,
+        t_emb: torch.Tensor,
+        text_t: torch.Tensor,
+        lead_idx: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Concatenate timestep, text, and (optionally) lead conditioning."""
+        parts = [t_emb, nn.functional.silu(self.text_proj(text_t))]
+        if self._lead_emb_dim > 0:
+            if lead_idx is not None:
+                parts.append(nn.functional.silu(self.lead_proj(self.lead_embed(lead_idx))))
+            else:
+                # No lead provided — zero-fill the lead slot so cond_dim is consistent
+                parts.append(torch.zeros(t_emb.shape[0], self._text_proj_dim,
+                                         device=t_emb.device, dtype=t_emb.dtype))
+        return torch.cat(parts, dim=-1)
 
     def _encode(self, ecg_t: torch.Tensor, cond: torch.Tensor) -> tuple:
         """Run encoder, return (bottleneck, list_of_skips)."""
@@ -209,28 +272,72 @@ class ECGUNet(nn.Module):
         for down in self.downs[:-1]:
             h = down(h, cond)
             skips.append(h)
+        h = self.encoder_attn(h)   # stride-4 attention before final down
         h = self.downs[-1](h, cond)
         h = self.mid(h, cond)
+        h = self.bottleneck_attn(h)
         return h, skips
 
-    def encode(self, ecg_t: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self,
+        ecg_t: torch.Tensor,
+        t_emb: torch.Tensor,
+        lead_idx: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Mean-pool bottleneck for cross-modal text conditioning.
+
+        Text is zeroed out here because encode() is called from the text score
+        network to extract the ECG representation — no text is available.  Lead
+        identity is passed through so the bottleneck is lead-aware.
 
         Args:
             ecg_t: Noisy ECG of shape (B, n_leads, seq_len).
             t_emb: Timestep embedding of shape (B, timestep_dim).
+            lead_idx: Optional lead indices of shape (B,), values in 0–11.
 
         Returns:
             Pooled bottleneck of shape (B, bottleneck_ch).
         """
         B = ecg_t.shape[0]
-        text_zero = torch.zeros(B, self._text_proj_dim, device=ecg_t.device)
-        cond = torch.cat([t_emb, text_zero], dim=-1)
+        text_zero = torch.zeros(B, self.text_proj.in_features, device=ecg_t.device)
+        cond = self._cond(t_emb, text_zero, lead_idx)
         h, _ = self._encode(ecg_t, cond)
         return h.mean(dim=-1)
 
+    def reconstruct(
+        self,
+        ecg: torch.Tensor,
+        lead_idx: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Reconstruct ECG with zero time/text conditioning (autoencoder pretraining).
+
+        Lead identity IS passed through (if provided) so the model learns
+        lead-specific morphology during pretraining.
+
+        Args:
+            ecg: Clean ECG of shape (B, n_leads, seq_len).
+            lead_idx: Optional lead indices of shape (B,), values in 0–11.
+
+        Returns:
+            Reconstruction of the same shape.
+        """
+        B = ecg.shape[0]
+        t_zero = torch.zeros(B, self._text_proj_dim, device=ecg.device, dtype=ecg.dtype)
+        text_zero = torch.zeros(B, self.text_proj.in_features, device=ecg.device, dtype=ecg.dtype)
+        cond = self._cond(t_zero, text_zero, lead_idx)
+        h, skips = self._encode(ecg, cond)
+        h = self.ups[0](h, skips[-1], cond)
+        for i, up in enumerate(self.ups[1:]):
+            h = up(h, skips[-(i + 2)], cond)
+        h = nn.functional.silu(self.output_norm(h))
+        return self.output_conv(h)
+
     def forward(
-        self, ecg_t: torch.Tensor, text_t: torch.Tensor, t: torch.Tensor
+        self,
+        ecg_t: torch.Tensor,
+        text_t: torch.Tensor,
+        t: torch.Tensor,
+        lead_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Estimate the score of the ECG marginal at time t.
 
@@ -238,12 +345,13 @@ class ECGUNet(nn.Module):
             ecg_t: Noisy ECG of shape (B, n_leads, seq_len).
             text_t: Noisy text embedding of shape (B, text_dim).
             t: Timesteps of shape (B,).
+            lead_idx: Optional lead indices of shape (B,), values in 0–11.
 
         Returns:
             Score estimate of shape (B, n_leads, seq_len).
         """
         t_emb = self.t_embed(t)
-        cond = self._cond(t_emb, text_t)
+        cond = self._cond(t_emb, text_t, lead_idx)
         h, skips = self._encode(ecg_t, cond)
         h = self.ups[0](h, skips[-1], cond)
         for i, up in enumerate(self.ups[1:]):

@@ -36,7 +36,7 @@ from torch.utils.data import Dataset
 
 N_LEADS = 12
 SEQ_LEN = 1000
-LEAD_IDX = 1
+LEAD_IDX = 1           # default single-lead index (Lead II) used in single-lead mode
 BERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
 PTBXL_CSV = "ptbxl_database.csv"
 RECORDS_DIR = "records100"
@@ -234,6 +234,24 @@ def build_embedding_cache(
     return cache
 
 
+def _preload_waveforms(records: list[dict[str, Any]]) -> dict[int, numpy.ndarray]:
+    """Parallel-load all waveforms, returning {index: ndarray}."""
+    n = len(records)
+    t0 = time.time()
+    waveforms: dict[int, numpy.ndarray] = {}
+    with ProcessPoolExecutor() as ex:
+        futures = {ex.submit(_load_waveform, rec): i for i, rec in enumerate(records)}
+        for done, fut in enumerate(as_completed(futures), 1):
+            waveforms[futures[fut]] = fut.result()
+            if done % 2000 == 0 or done == n:
+                rate = done / (time.time() - t0)
+                print(
+                    f"  preload {done}/{n} | {rate:.0f} rec/s"
+                    f" | ETA {(n - done) / rate:.0f}s"
+                )
+    return waveforms
+
+
 class PTBXLDataset(Dataset):
     """PTB-XL (ECG, text embedding) dataset, fully pre-loaded into RAM.
 
@@ -259,18 +277,7 @@ class PTBXLDataset(Dataset):
 
         n = len(records)
         print(f"  preloading {n} waveforms into RAM…")
-        waveforms: dict[int, numpy.ndarray] = {}
-        t0 = time.time()
-        with ProcessPoolExecutor() as ex:
-            futures = {ex.submit(_load_waveform, rec): i for i, rec in enumerate(records)}
-            for done, fut in enumerate(as_completed(futures), 1):
-                waveforms[futures[fut]] = fut.result()
-                if done % 2000 == 0 or done == n:
-                    rate = done / (time.time() - t0)
-                    print(
-                        f"  preload {done}/{n} | {rate:.0f} rec/s"
-                        f" | ETA {(n - done) / rate:.0f}s"
-                    )
+        waveforms = _preload_waveforms(records)
 
         ecgs, text_embs, rids, labels = [], [], [], []
         for i, rec in enumerate(records):
@@ -300,17 +307,87 @@ class PTBXLDataset(Dataset):
         }
 
 
+class PTBXLMultiLeadDataset(Dataset):
+    """PTB-XL dataset expanded to all 12 leads.
+
+    Each PTB-XL recording yields 12 training samples — one per lead — with a
+    ``lead_idx`` key (0–11) so the model can condition on lead identity.
+
+    The per-lead normalisation (mean/std of shape (N_LEADS,)) is applied to all
+    leads before storage.  Text embeddings are shared across all 12 leads of
+    the same recording.
+
+    Effective dataset size is 12× the number of recordings.
+
+    Args:
+        records: Record dicts for this split.
+        embedding_cache: Dict mapping ecg_id → BioClinicalBERT embedding.
+        mean: Per-lead mean of shape (N_LEADS,) from the training set.
+        std: Per-lead std of shape (N_LEADS,) from the training set.
+    """
+
+    def __init__(
+        self,
+        records: list[dict[str, Any]],
+        embedding_cache: dict[str, numpy.ndarray],
+        mean: numpy.ndarray,
+        std: numpy.ndarray,
+    ) -> None:
+        mean_t = torch.from_numpy(mean[:, None])   # (N_LEADS, 1)
+        std_t = torch.from_numpy(std[:, None])     # (N_LEADS, 1)
+
+        n = len(records)
+        print(f"  preloading {n} waveforms (all 12 leads) into RAM…")
+        waveforms = _preload_waveforms(records)
+
+        # Store all 12 leads normalised: (N, 12, SEQ_LEN)
+        ecgs_all, text_embs_all, rids_all, labels_all = [], [], [], []
+        for i, rec in enumerate(records):
+            rid = str(rec["ecg_id"])
+            ecg = torch.from_numpy(waveforms[i])   # (12, SEQ_LEN)
+            ecg = (ecg - mean_t) / std_t           # per-lead normalisation
+            ecgs_all.append(ecg)
+            text_embs_all.append(torch.from_numpy(embedding_cache[rid]))
+            rids_all.append(rid)
+            labels_all.append(int(rec["label"]))
+
+        # (N, 12, SEQ_LEN)
+        self._ecgs = torch.stack(ecgs_all)
+        # (N, 768)
+        self._text_embs = torch.stack(text_embs_all)
+        self._rids = rids_all
+        self._labels = labels_all
+        self._n_recordings = n
+
+    def __len__(self) -> int:
+        return self._n_recordings * N_LEADS
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        rec_idx = idx // N_LEADS
+        lead = idx % N_LEADS
+        return {
+            "ecg": self._ecgs[rec_idx, lead: lead + 1, :],   # (1, SEQ_LEN)
+            "text_emb": self._text_embs[rec_idx],
+            "lead_idx": lead,
+            "record_id": self._rids[rec_idx],
+            "label": self._labels[rec_idx],
+        }
+
+
 def build_datasets(
     data_dir: str = "data/ptbxl",
     cache_dir: str = "cache",
     bert_device: str = "cpu",
-) -> tuple[PTBXLDataset, PTBXLDataset, PTBXLDataset]:
+    multi_lead: bool = False,
+) -> tuple[Dataset, Dataset, Dataset]:
     """Load PTB-XL, cache BERT embeddings and ECG stats, return all three splits.
 
     Args:
         data_dir: Root of the PTB-XL PhysioNet directory.
         cache_dir: Directory for bert_embeddings.pkl and ecg_stats.pkl.
         bert_device: Device for BioClinicalBERT encoding.
+        multi_lead: If True, return PTBXLMultiLeadDataset (12× data, with
+            lead_idx per sample) instead of single-lead PTBXLDataset.
 
     Returns:
         Tuple of (train_dataset, val_dataset, test_dataset).
@@ -335,8 +412,9 @@ def build_datasets(
         with open(stats_path, "wb") as f:
             pickle.dump((mean, std), f)
 
+    cls = PTBXLMultiLeadDataset if multi_lead else PTBXLDataset
     return (
-        PTBXLDataset(train_recs, emb_cache, mean, std),
-        PTBXLDataset(val_recs, emb_cache, mean, std),
-        PTBXLDataset(test_recs, emb_cache, mean, std),
+        cls(train_recs, emb_cache, mean, std),
+        cls(val_recs, emb_cache, mean, std),
+        cls(test_recs, emb_cache, mean, std),
     )

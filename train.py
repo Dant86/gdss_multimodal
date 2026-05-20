@@ -15,7 +15,21 @@ import config as cfg_module
 import modal_common
 
 
-def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True):
+def _init_ema(model) -> dict:
+    """Initialise an EMA shadow as a clone of the current state dict."""
+    import torch
+    return {k: v.clone() for k, v in model.state_dict().items()}
+
+
+def _update_ema(ema: dict, model, decay: float = 0.9999) -> None:
+    """Update EMA shadow in-place: shadow = decay·shadow + (1−decay)·param."""
+    import torch
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            ema[k].mul_(decay).add_(v, alpha=1.0 - decay)
+
+
+def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True, lead_idx=None):
     """Compute joint denoising score matching loss.
 
     Args:
@@ -25,6 +39,7 @@ def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True):
         text0: Clean text embedding batch of shape (B, text_dim).
         vpsde: VP-SDE instance.
         likelihood_weighting: Whether to weight by σ(t)².
+        lead_idx: Optional lead indices of shape (B,) for lead-conditioned scoring.
 
     Returns:
         Scalar DSM loss.
@@ -40,8 +55,8 @@ def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True):
     ecg_t = mean1 + std1 * eps1
     text_t = mean2 + std2 * eps2
 
-    score_ecg = s_theta(ecg_t, text_t, t)
-    score_text = s_phi(text_t, _ecg_rep(s_theta, ecg_t, text_t, t), t)
+    score_ecg = s_theta(ecg_t, text_t, t, lead_idx)
+    score_text = s_phi(text_t, _ecg_rep(s_theta, ecg_t, text_t, t, lead_idx), t)
 
     shape1 = (-1,) + (1,) * (ecg0.dim() - 1)
     shape2 = (-1,) + (1,) * (text0.dim() - 1)
@@ -51,16 +66,27 @@ def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True):
     loss_ecg = (score_ecg - target_ecg) ** 2
     loss_text = (score_text - target_text) ** 2
     if likelihood_weighting:
-        loss_ecg = std1.view(shape1) ** 2 * loss_ecg
-        loss_text = std2.view(shape2) ** 2 * loss_text
+        # Min-SNR weighting (Hang et al. 2023, γ=5).
+        # Correct form: σ² · min(SNR, γ) = min(α², γσ²).
+        # This retains σ² damping so the weight → 0 at both t→0 and t→T,
+        # but peaks at the SNR=γ transition (~t=0.13 with our schedule)
+        # where ECG structure is still partially visible in the noisy signal.
+        # Without the σ² factor, weight=γ at low-t where target=-ε/σ blows up.
+        _MINSNR_GAMMA = 5.0
+        alpha_t = vpsde.alpha(t)                            # (B,)
+        sigma_t = vpsde.sigma(t).clamp(min=1e-8)            # (B,)
+        snr = (alpha_t / sigma_t).pow(2)                    # (B,)
+        w = sigma_t.pow(2) * snr.clamp(max=_MINSNR_GAMMA)  # σ²·min(SNR,γ)
+        loss_ecg  = w.view(shape1) * loss_ecg
+        loss_text = w.view(shape2) * loss_text
     return loss_ecg.mean() + loss_text.mean()
 
 
-def _ecg_rep(s_theta, ecg_t, text_t, t):
+def _ecg_rep(s_theta, ecg_t, text_t, t, lead_idx=None):
     import torch
 
     with torch.no_grad():
-        h = s_theta.encode(ecg_t, s_theta.t_embed(t))
+        h = s_theta.encode(ecg_t, s_theta.t_embed(t), lead_idx)
     return h.detach()
 
 
@@ -86,9 +112,11 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
     _seed(cfg.train.seed)
 
-    print("Loading datasets…")
+    multi_lead = cfg.ecg_score.lead_emb_dim > 0
+    print(f"Loading datasets… (multi_lead={multi_lead})")
     train_ds, val_ds, _ = data_module.build_datasets(
-        cfg.train.data_dir, cfg.train.data_cache_dir, bert_device=cfg.train.device
+        cfg.train.data_dir, cfg.train.data_cache_dir,
+        bert_device=cfg.train.device, multi_lead=multi_lead,
     )
     train_loader = DataLoader(
         train_ds,
@@ -114,6 +142,7 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
         timestep_dim=cfg.ecg_score.timestep_dim,
         channels=cfg.ecg_score.channels,
         bottleneck_ch=cfg.ecg_score.bottleneck_ch,
+        lead_emb_dim=cfg.ecg_score.lead_emb_dim,
     ).to(device)
     s_phi = models_module.TextScoreNet(
         text_dim=cfg.text_score.text_dim,
@@ -124,15 +153,40 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
     ).to(device)
     vpsde = sde_module.VPSDE(cfg.sde.beta_min, cfg.sde.beta_max, cfg.sde.T, cfg.sde.eps)
 
+    if cfg.train.pretrain_checkpoint:
+        ckpt_path = Path(cfg.train.pretrain_checkpoint)
+        print(f"Loading pretrained ECGUNet weights from {ckpt_path}…")
+        state = torch.load(ckpt_path, map_location=device)
+        missing, unexpected = s_theta.load_state_dict(state["s_theta"], strict=False)
+        if missing:
+            print(f"  missing keys: {missing}")
+        if unexpected:
+            print(f"  unexpected keys: {unexpected}")
+        print("  pretrained weights loaded.")
+
+    if cfg.train.resume_checkpoint:
+        ckpt_path = Path(cfg.train.resume_checkpoint)
+        print(f"Resuming from training checkpoint {ckpt_path} (EMA weights, fresh optimiser)…")
+        state = torch.load(ckpt_path, map_location=device)
+        # Prefer EMA weights — they are smoother than the final training weights
+        s_theta.load_state_dict(state.get("s_theta_ema", state["s_theta"]))
+        s_phi.load_state_dict(state.get("s_phi_ema", state["s_phi"]))
+        print("  resumed.")
+
     use_amp = device.type == "cuda"
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else torch.autocast("cpu")
 
     params = list(s_theta.parameters()) + list(s_phi.parameters())
     optimiser = AdamW(params, lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
-    scheduler = CosineAnnealingLR(optimiser, T_max=cfg.train.max_steps)
+    scheduler = CosineAnnealingLR(
+        optimiser, T_max=cfg.train.max_steps, eta_min=cfg.train.lr * 0.05
+    )
 
     ckpt_dir = Path(cfg.train.checkpoint_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    ema_theta = _init_ema(s_theta)
+    ema_phi   = _init_ema(s_phi)
 
     step = 0
     loss_ema = None
@@ -149,14 +203,18 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
             loader_iter = iter(train_loader)
             batch = next(loader_iter)
 
-        ecg0, text0 = batch["ecg"].to(device), batch["text_emb"].to(device)
+        ecg0 = batch["ecg"].to(device)
+        text0 = batch["text_emb"].to(device)
+        lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
         optimiser.zero_grad()
         with autocast:
-            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting)
+            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting, lead_idx)
         loss.backward()
         nn.utils.clip_grad_norm_(params, cfg.train.grad_clip)
         optimiser.step()
         scheduler.step()
+        _update_ema(ema_theta, s_theta)
+        _update_ema(ema_phi, s_phi)
         step += 1
 
         raw = loss.item()
@@ -167,11 +225,11 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
             val_loss = _validate(s_theta, s_phi, val_loader, vpsde, device, cfg)
             print(f"step {step:6d} | val {val_loss:.4f} | ema {loss_ema:.4f} | {elapsed / 60:.1f} min")
         if step % cfg.train.save_every == 0:
-            _save(s_theta, s_phi, optimiser, step, ckpt_dir)
+            _save(s_theta, s_phi, optimiser, step, ckpt_dir, ema_theta=ema_theta, ema_phi=ema_phi)
             if on_checkpoint:
                 on_checkpoint(step)
 
-    _save(s_theta, s_phi, optimiser, step, ckpt_dir, name="final")
+    _save(s_theta, s_phi, optimiser, step, ckpt_dir, name="final", ema_theta=ema_theta, ema_phi=ema_phi)
     if on_checkpoint:
         on_checkpoint(step)
     print("Training complete.")
@@ -185,8 +243,10 @@ def _validate(s_theta, s_phi, loader, vpsde, device, cfg):
     total, count = 0.0, 0
     with torch.no_grad():
         for batch in loader:
-            ecg0, text0 = batch["ecg"].to(device), batch["text_emb"].to(device)
-            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting)
+            ecg0 = batch["ecg"].to(device)
+            text0 = batch["text_emb"].to(device)
+            lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
+            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting, lead_idx)
             total += loss.item() * ecg0.shape[0]
             count += ecg0.shape[0]
     s_theta.train()
@@ -194,19 +254,21 @@ def _validate(s_theta, s_phi, loader, vpsde, device, cfg):
     return total / count
 
 
-def _save(s_theta, s_phi, optimiser, step, ckpt_dir, name=None):
+def _save(s_theta, s_phi, optimiser, step, ckpt_dir, name=None, ema_theta=None, ema_phi=None):
     import torch
 
     path = ckpt_dir / f"{name or f'step_{step:07d}'}.pt"
-    torch.save(
-        {
-            "step": step,
-            "s_theta": s_theta.state_dict(),
-            "s_phi": s_phi.state_dict(),
-            "optimiser": optimiser.state_dict(),
-        },
-        path,
-    )
+    payload = {
+        "step": step,
+        "s_theta": s_theta.state_dict(),
+        "s_phi": s_phi.state_dict(),
+        "optimiser": optimiser.state_dict(),
+    }
+    if ema_theta is not None:
+        payload["s_theta_ema"] = ema_theta
+    if ema_phi is not None:
+        payload["s_phi_ema"] = ema_phi
+    torch.save(payload, path)
     print(f"  checkpoint saved → {path}")
 
 
@@ -228,13 +290,14 @@ def _seed(seed: int) -> None:
     timeout=72_000,
     secrets=modal_common.HF_SECRETS,
 )
-def train_on_modal(max_steps=100_000, batch_size=128, lr=2e-4):
+def train_on_modal(max_steps=100_000, batch_size=256, lr=2e-4, pretrain_checkpoint="", resume_checkpoint=""):
     """Modal entry point for distributed training.
 
     Args:
         max_steps: Total training steps.
         batch_size: Per-GPU batch size.
         lr: Initial learning rate.
+        pretrain_checkpoint: Optional path to a pretrained ECGUNet checkpoint.
     """
     import os
 
@@ -248,6 +311,8 @@ def train_on_modal(max_steps=100_000, batch_size=128, lr=2e-4):
     cfg.train.data_dir = f"{modal_common.REMOTE_CACHE}/ptbxl"
     cfg.train.data_cache_dir = modal_common.REMOTE_CACHE
     cfg.train.checkpoint_dir = modal_common.REMOTE_CKPTS
+    cfg.train.pretrain_checkpoint = pretrain_checkpoint
+    cfg.train.resume_checkpoint = resume_checkpoint
 
     def commit_after_save(step):
         print(f"  committing checkpoint volume at step {step}…")
@@ -259,8 +324,8 @@ def train_on_modal(max_steps=100_000, batch_size=128, lr=2e-4):
 
 
 @modal_common.app.local_entrypoint(name="train")
-def main(max_steps: int = 100_000, batch_size: int = 128, lr: float = 2e-4):
-    train_on_modal.remote(max_steps=max_steps, batch_size=batch_size, lr=lr)
+def main(max_steps: int = 100_000, batch_size: int = 256, lr: float = 2e-4, pretrain_checkpoint: str = "", resume_checkpoint: str = ""):
+    train_on_modal.remote(max_steps=max_steps, batch_size=batch_size, lr=lr, pretrain_checkpoint=pretrain_checkpoint, resume_checkpoint=resume_checkpoint)
 
 
 if __name__ == "__main__":

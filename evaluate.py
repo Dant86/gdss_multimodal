@@ -216,13 +216,14 @@ def _build_real_data(data_dir: str, cache_dir: str, n_samples: int):
 
 
 def _run_one_cell(sampler_name, nfe, s_theta, s_phi, vpsde, real_ecgs, real_texts,
-                  real_labels, classifier, device, cfg, n_samples):
+                  real_labels, classifier, device, cfg, n_samples, lead_idx: int = 1):
     import sample as sample_module
 
     print(f"\n{sampler_name.upper()} NFE={nfe}")
     gen_ecgs, gen_texts = sample_module.generate(
         s_theta, s_phi, vpsde, sampler_name, n_samples,
         cfg.eval.batch_size, nfe, cfg.eval.sampler.corrector_snr, device, cfg,
+        lead_idx=lead_idx,
     )
     fid = ecg_fid(real_ecgs, gen_ecgs, device)
     cos = text_cosine_sim(gen_texts, real_texts)
@@ -250,7 +251,7 @@ def print_ablation_table(results: dict) -> None:
     timeout=10_800,
     secrets=modal_common.HF_SECRETS,
 )
-def eval_one_cell(sampler_name, nfe, checkpoint, n_samples, corrector_snr):
+def eval_one_cell(sampler_name, nfe, checkpoint, n_samples, corrector_snr, lead_idx: int = 1):
     """Modal entry point for a single ablation cell.
 
     Args:
@@ -259,6 +260,8 @@ def eval_one_cell(sampler_name, nfe, checkpoint, n_samples, corrector_snr):
         checkpoint: Checkpoint name stem.
         n_samples: Number of generated samples.
         corrector_snr: Langevin corrector SNR.
+        lead_idx: Which lead to generate (0–11, default 1 = Lead II).
+            Real comparison data is always Lead II, so keep this at 1 for FID.
 
     Returns:
         Tuple of (sampler_name, nfe, metrics).
@@ -289,6 +292,7 @@ def eval_one_cell(sampler_name, nfe, checkpoint, n_samples, corrector_snr):
     metrics = _run_one_cell(
         sampler_name, nfe, s_theta, s_phi, vpsde,
         real_ecgs, real_texts, real_labels, classifier, device, cfg, n_samples,
+        lead_idx=lead_idx,
     )
     return sampler_name, nfe, metrics
 
@@ -300,11 +304,12 @@ def main(
     corrector_snr: float = 0.16,
     nfe: str = "100,500,1000",
     samplers: str = "s4,pc,em",
+    lead_idx: int = 1,
 ):
     nfe_list = [int(n) for n in nfe.split(",")]
     sampler_list = samplers.split(",")
     cells = [
-        (s, n, checkpoint, n_samples, corrector_snr)
+        (s, n, checkpoint, n_samples, corrector_snr, lead_idx)
         for s in sampler_list
         for n in nfe_list
     ]

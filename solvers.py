@@ -29,6 +29,34 @@ ScoreFn = typing.Callable[
 ]
 
 
+def _clip_score(score: torch.Tensor, x: torch.Tensor, max_ratio: float = 5.0) -> torch.Tensor:
+    """Clip score so its per-sample norm ≤ max_ratio · ‖x‖ / √d.
+
+    At the DSM optimum the score norm is ~‖x‖ (one noise vector); this cap
+    allows max_ratio× overshoot before truncating, guarding against blow-up
+    from a freshly fine-tuned (or pretrained-then-finetuned) score network
+    that hasn't fully calibrated output magnitudes.
+
+    Args:
+        score: Score tensor of the same shape as x.
+        x: Current noisy sample.
+        max_ratio: Maximum allowed ‖score‖ / (‖x‖ / √d) ratio.
+
+    Returns:
+        Score tensor with norms clipped.
+    """
+    score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+    B = x.shape[0]
+    x_norm = x.view(B, -1).norm(dim=1)            # (B,)
+    s_norm = score.view(B, -1).norm(dim=1)         # (B,)
+    # At the DSM optimum: s*(x_t,t) = -ε/σ(t), so ‖s*‖ ≈ ‖ε‖ ≈ ‖x_t‖.
+    # Allow max_ratio× overshoot before clipping.
+    limit = max_ratio * x_norm
+    ratio = (limit / s_norm.clamp(min=1e-8)).clamp(max=1.0)
+    ratio = ratio.view((-1,) + (1,) * (score.dim() - 1))
+    return score * ratio
+
+
 def _reverse_sde_step(
     x: torch.Tensor,
     score: torch.Tensor,
@@ -48,6 +76,7 @@ def _reverse_sde_step(
     Returns:
         Sample at time t − dt.
     """
+    score = _clip_score(score, x)
     drift = vpsde.reverse_drift(x, score, t)
     g = vpsde.diffusion_coeff(t)
     shape = (-1,) + (1,) * (x.dim() - 1)
@@ -76,13 +105,14 @@ def _langevin_step(
     Returns:
         Updated sample after one Langevin step.
     """
-    score = score_fn(x, x_cross, t)
+    score = _clip_score(score_fn(x, x_cross, t), x)
     B = x.shape[0]
     x_norm = x.view(B, -1).norm(dim=1)
     s_norm = score.view(B, -1).norm(dim=1).clamp(min=1e-8)
-    # Clamp at 1.0 to prevent blow-up when score is small relative to x
-    # (common early in training or at large t where score norms are weak).
-    eps = ((snr * x_norm / s_norm) ** 2).clamp(max=1.0)
+    # Clamp at 2×snr² ≈ 0.05 to prevent accumulation over many corrector steps.
+    # At ideal score s_norm ≈ x_norm, eps = snr² = 0.0256; this cap allows
+    # 2× overshoot before cutting off, preventing GroupNorm NaN on long runs.
+    eps = ((snr * x_norm / s_norm) ** 2).clamp(max=2 * snr ** 2)
     eps = eps.view((-1,) + (1,) * (x.dim() - 1))
     return x + eps * score + (2 * eps).sqrt() * torch.randn_like(x)
 

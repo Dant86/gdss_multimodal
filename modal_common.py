@@ -55,6 +55,8 @@ base_image = (
         "scipy>=1.11.0",
         "pandas>=2.0.0",
         "wfdb>=4.1.0",
+        "plotly>=5.0",
+        "kaleido==0.2.1",
     )
     .env({"PYTHONPATH": "/app"})
 )
@@ -94,4 +96,4 @@ try:
 except Exception:
     HF_SECRETS = []
 
-GPU = "H100"
+GPU = "H200"

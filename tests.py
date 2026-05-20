@@ -134,27 +134,74 @@ class TestECGScoreNet:
             timestep_dim=32,
             channels=(8, 16),
             bottleneck_ch=32,
+            lead_emb_dim=16,
+        )
+
+    @pytest.fixture
+    def model_no_lead(self):
+        """Backward-compat: no lead embedding."""
+        import models as models_module
+
+        return models_module.ECGUNet(
+            text_dim=TEXT_DIM,
+            n_leads=N_LEADS,
+            seq_len=SEQ_LEN,
+            timestep_dim=32,
+            channels=(8, 16),
+            bottleneck_ch=32,
+            lead_emb_dim=0,
         )
 
     def test_forward_shape(self, model):
         ecg_t = torch.randn(B, N_LEADS, SEQ_LEN)
         text_t = torch.randn(B, TEXT_DIM)
         t = torch.rand(B)
-        out = model(ecg_t, text_t, t)
+        lead_idx = torch.randint(0, 12, (B,))
+        out = model(ecg_t, text_t, t, lead_idx)
         assert out.shape == (B, N_LEADS, SEQ_LEN)
 
     def test_forward_finite(self, model):
         ecg_t = torch.randn(B, N_LEADS, SEQ_LEN)
         text_t = torch.randn(B, TEXT_DIM)
         t = torch.rand(B)
-        out = model(ecg_t, text_t, t)
+        lead_idx = torch.randint(0, 12, (B,))
+        out = model(ecg_t, text_t, t, lead_idx)
         assert torch.isfinite(out).all()
+
+    def test_forward_no_lead_idx(self, model):
+        """lead_idx=None should still work (zeroes the lead slot)."""
+        ecg_t = torch.randn(B, N_LEADS, SEQ_LEN)
+        text_t = torch.randn(B, TEXT_DIM)
+        t = torch.rand(B)
+        out = model(ecg_t, text_t, t)
+        assert out.shape == (B, N_LEADS, SEQ_LEN)
+        assert torch.isfinite(out).all()
+
+    def test_forward_shape_no_lead_emb(self, model_no_lead):
+        """lead_emb_dim=0 path."""
+        ecg_t = torch.randn(B, N_LEADS, SEQ_LEN)
+        text_t = torch.randn(B, TEXT_DIM)
+        t = torch.rand(B)
+        out = model_no_lead(ecg_t, text_t, t)
+        assert out.shape == (B, N_LEADS, SEQ_LEN)
 
     def test_encode_shape(self, model):
         ecg_t = torch.randn(B, N_LEADS, SEQ_LEN)
         t_emb = model.t_embed(torch.rand(B))
-        rep = model.encode(ecg_t, t_emb)
+        lead_idx = torch.randint(0, 12, (B,))
+        rep = model.encode(ecg_t, t_emb, lead_idx)
         assert rep.shape == (B, model.bottleneck_ch)
+
+    def test_reconstruct_shape(self, model):
+        ecg = torch.randn(B, N_LEADS, SEQ_LEN)
+        lead_idx = torch.randint(0, 12, (B,))
+        recon = model.reconstruct(ecg, lead_idx)
+        assert recon.shape == ecg.shape
+
+    def test_reconstruct_finite(self, model):
+        ecg = torch.randn(B, N_LEADS, SEQ_LEN)
+        lead_idx = torch.randint(0, 12, (B,))
+        assert torch.isfinite(model.reconstruct(ecg, lead_idx)).all()
 
 
 class TestTextScoreNet:

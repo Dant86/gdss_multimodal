@@ -35,6 +35,7 @@ def load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device):
         timestep_dim=cfg.ecg_score.timestep_dim,
         channels=cfg.ecg_score.channels,
         bottleneck_ch=cfg.ecg_score.bottleneck_ch,
+        lead_emb_dim=cfg.ecg_score.lead_emb_dim,
     ).to(device)
     s_phi = models_module.TextScoreNet(
         text_dim=cfg.text_score.text_dim,
@@ -45,14 +46,16 @@ def load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device):
     ).to(device)
 
     ckpt = torch.load(ckpt_path, map_location=device)
-    s_theta.load_state_dict(ckpt["s_theta"])
-    s_phi.load_state_dict(ckpt["s_phi"])
+    # Prefer EMA weights for sampling — they are smoother and produce better samples
+    s_theta.load_state_dict(ckpt.get("s_theta_ema", ckpt["s_theta"]))
+    s_phi.load_state_dict(ckpt.get("s_phi_ema", ckpt["s_phi"]))
     s_theta.eval()
     s_phi.eval()
     return s_theta, s_phi
 
 
-def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps, snr, device, cfg):
+def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps, snr, device, cfg,
+             lead_idx: int = 1):
     """Run reverse diffusion to generate (ECG, text) pairs.
 
     Args:
@@ -66,6 +69,8 @@ def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps
         snr: Langevin corrector SNR.
         device: Torch device.
         cfg: Experiment configuration.
+        lead_idx: Which lead to generate (0–11). Default 1 = Lead II.
+            Set to -1 to sample randomly across all 12 leads.
 
     Returns:
         Tuple of (ecg_array, text_array) as numpy arrays.
@@ -77,18 +82,28 @@ def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps
 
     sampler = solvers_module.SAMPLERS[sampler_name]
     all_ecg, all_text = [], []
-
-    def score_ecg(m1, m2, t):
-        return s_theta(m1, m2, t)
-
-    def score_text(m2, m1, t):
-        h = s_theta.encode(m1, s_theta.t_embed(t))
-        return s_phi(m2, h, t)
+    _use_lead_cond = cfg.ecg_score.lead_emb_dim > 0
 
     generated = 0
     with torch.no_grad():
         while generated < n_samples:
             B = min(batch_size, n_samples - generated)
+
+            if _use_lead_cond:
+                if lead_idx < 0:
+                    lidx = torch.randint(0, 12, (B,), device=device)
+                else:
+                    lidx = torch.full((B,), lead_idx, dtype=torch.long, device=device)
+            else:
+                lidx = None
+
+            def score_ecg(m1, m2, t, _lidx=lidx):
+                return s_theta(m1, m2, t, _lidx)
+
+            def score_text(m2, m1, t, _lidx=lidx):
+                h = s_theta.encode(m1, s_theta.t_embed(t), _lidx)
+                return s_phi(m2, h, t)
+
             m1_T = torch.randn(B, cfg.ecg_score.n_leads, cfg.ecg_score.seq_len, device=device)
             m2_T = torch.randn(B, cfg.text_score.text_dim, device=device)
             m1, m2 = sampler(m1_T, m2_T, score_ecg, score_text, vpsde, n_steps=n_steps, snr=snr)
@@ -114,6 +129,7 @@ def sample_on_modal(
     n_samples=1000,
     batch_size=32,
     corrector_snr=0.16,
+    lead_idx=1,
 ):
     """Modal entry point for sample generation.
 
@@ -124,6 +140,7 @@ def sample_on_modal(
         n_samples: Total samples to generate.
         batch_size: Generation batch size.
         corrector_snr: Langevin corrector SNR.
+        lead_idx: Lead to generate (0–11, default 1 = Lead II; -1 = random).
     """
     import os
 
@@ -139,7 +156,8 @@ def sample_on_modal(
 
     s_theta, s_phi = load_models(Path(modal_common.REMOTE_CKPTS) / f"{checkpoint}.pt", cfg, device)
     ecgs, texts = generate(
-        s_theta, s_phi, vpsde, sampler, n_samples, batch_size, n_steps, corrector_snr, device, cfg
+        s_theta, s_phi, vpsde, sampler, n_samples, batch_size, n_steps, corrector_snr, device, cfg,
+        lead_idx=lead_idx,
     )
 
     out = Path(modal_common.REMOTE_SAMPLES)
@@ -159,6 +177,7 @@ def main(
     n_samples: int = 1000,
     batch_size: int = 32,
     corrector_snr: float = 0.16,
+    lead_idx: int = 1,
 ):
     sample_on_modal.remote(
         checkpoint=checkpoint,
@@ -167,6 +186,7 @@ def main(
         n_samples=n_samples,
         batch_size=batch_size,
         corrector_snr=corrector_snr,
+        lead_idx=lead_idx,
     )
 
 
@@ -184,6 +204,8 @@ if __name__ == "__main__":
     parser.add_argument("--n-samples", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--corrector-snr", type=float, default=0.16)
+    parser.add_argument("--lead-idx", type=int, default=1,
+                        help="Lead to generate (0-11; -1=random). Default 1=Lead II.")
     parser.add_argument("--output-dir", default="samples")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -198,6 +220,7 @@ if __name__ == "__main__":
     ecgs, texts = generate(
         s_theta, s_phi, vpsde, args.sampler, args.n_samples,
         args.batch_size, args.n_steps, args.corrector_snr, device, cfg,
+        lead_idx=args.lead_idx,
     )
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
