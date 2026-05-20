@@ -365,7 +365,7 @@ class PTBXLDataset(Dataset):
                 rpeaks.append(torch.zeros(1, SEQ_LEN))
 
         self.ecgs = torch.stack(ecgs)
-        self.text_embs = torch.stack(text_embs)
+        self.text_embs = torch.nn.functional.normalize(torch.stack(text_embs), dim=-1)
         self.rpeaks = torch.stack(rpeaks)
         self.rids = rids
         self.labels = labels
@@ -435,8 +435,8 @@ class PTBXLMultiLeadDataset(Dataset):
 
         # (N, 12, SEQ_LEN)
         self._ecgs = torch.stack(ecgs_all)
-        # (N, 768)
-        self._text_embs = torch.stack(text_embs_all)
+        # (N, 768) — L2-normalised so all embeddings sit on the unit sphere
+        self._text_embs = torch.nn.functional.normalize(torch.stack(text_embs_all), dim=-1)
         # (N, 1, SEQ_LEN) — shared across all 12 leads per recording
         self._rpeaks = torch.stack(rpeaks_all)
         self._rids = rids_all

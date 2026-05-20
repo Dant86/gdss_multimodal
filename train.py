@@ -184,6 +184,31 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
             print(f"  unexpected keys: {unexpected}")
         print("  pretrained weights loaded.")
 
+        # Reinitialise FiLM output layers to identity (γ=1, β=0).
+        #
+        # During pretraining the time and text conditioning slots are always
+        # zero (t=0, text=zeros passed to reconstruct()).  FiLM therefore
+        # never sees non-zero signal from those 256 of 448 cond_dim dims and
+        # accumulates random or zero weights for them.  When DSM training
+        # first activates the time and text slots, those random weights
+        # produce enormous outputs → loss >> 50 → loss clamp zeros ALL
+        # gradients → the model is completely stuck.
+        #
+        # Fix: reset every FiLM output projection to the identity map so
+        # every block starts as h′ = 1·h + 0 regardless of what cond_dim
+        # carries.  The conv backbone's ECG-morphology knowledge is preserved;
+        # only the conditioning pathway is restarted from a safe prior.
+        _n_film = 0
+        for module in s_theta.modules():
+            if isinstance(module, models_module.FiLM):
+                last = module.net[-1]
+                nn.init.zeros_(last.weight)
+                half = last.out_features // 2
+                nn.init.constant_(last.bias[:half], 1.0)   # gamma initialised to 1
+                nn.init.zeros_(last.bias[half:])            # beta  initialised to 0
+                _n_film += 1
+        print(f"  {_n_film} FiLM output layers reset to identity (gamma=1, beta=0).")
+
     if cfg.train.resume_checkpoint:
         ckpt_path = Path(cfg.train.resume_checkpoint)
         print(f"Resuming from training checkpoint {ckpt_path} (EMA weights, fresh optimiser)…")
@@ -267,12 +292,43 @@ def _validate(s_theta, s_phi, loader, vpsde, device, cfg):
     s_theta.eval()
     s_phi.eval()
     total, count = 0.0, 0
+    _first_batch_diag = True
     with torch.no_grad():
         for batch in loader:
             ecg0 = batch["ecg"].to(device)
             text0 = batch["text_emb"].to(device)
             lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
             r_peak_mask = batch["r_peak_mask"].to(device) if "r_peak_mask" in batch else None
+
+            # ── First-batch diagnostics (printed once per val call) ──────────
+            if _first_batch_diag:
+                _first_batch_diag = False
+                t_diag = torch.empty(ecg0.shape[0], device=device).uniform_(vpsde.eps, vpsde.T)
+                m1, s1 = vpsde.marginal_prob(ecg0, t_diag)
+                m2, s2 = vpsde.marginal_prob(text0, t_diag)
+                e1 = torch.randn_like(ecg0)
+                e2 = torch.randn_like(text0)
+                ecg_t_d = m1 + s1 * e1
+                text_t_d = m2 + s2 * e2
+                sc_ecg = s_theta(ecg_t_d, text_t_d, t_diag, lead_idx, r_peak_mask)
+                h_bot = s_theta.encode(ecg_t_d, s_theta.t_embed(t_diag), lead_idx, r_peak_mask)
+                sc_txt = s_phi(text_t_d, h_bot, t_diag)
+                a_t = vpsde.alpha(t_diag); sig_t = vpsde.sigma(t_diag).clamp(min=1e-8)
+                w_t = sig_t.pow(2) * (a_t / sig_t).pow(2).clamp(max=5.0)
+                tgt_ecg = -e1 / s1.clamp(min=1e-8)
+                tgt_txt = -e2 / s2.clamp(min=1e-8)
+                l_ecg = (w_t.view(-1,1,1) * (sc_ecg - tgt_ecg)**2).mean()
+                l_txt = (w_t.view(-1,1) * (sc_txt - tgt_txt)**2).mean()
+                print(
+                    f"  [diag] ecg0 norm={ecg0.norm(dim=-1).mean():.2f} "
+                    f"text0 norm={text0.norm(dim=-1).mean():.2f} "
+                    f"h_bot mean={h_bot.mean():.2e} std={h_bot.std():.2e} max={h_bot.abs().max():.2e} | "
+                    f"score_ecg max={sc_ecg.abs().max():.2e} | score_text max={sc_txt.abs().max():.2e} | "
+                    f"t_diag min={t_diag.min():.3e} max={t_diag.max():.3e} | "
+                    f"sigma min={sig_t.min():.3e} | w max={w_t.max():.3e} | "
+                    f"loss_ecg={l_ecg:.4e} loss_text={l_txt:.4e}"
+                )
+
             loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting,
                             lead_idx, r_peak_mask=r_peak_mask)
             total += loss.item() * ecg0.shape[0]

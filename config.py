@@ -35,8 +35,8 @@ class TextScoreConfig:
     # Must match ECGScoreConfig.bottleneck_ch
     moment_hidden_dim: int = 512
     timestep_embed_dim: int = 256
-    hidden_dim: int = 512
-    n_layers: int = 4
+    hidden_dim: int = 1024
+    n_layers: int = 6
 
 
 @dataclass
@@ -64,10 +64,10 @@ class TrainConfig:
     batch_size: int = 256
     num_workers: int = 0
     # Optimization
-    lr: float = 2e-4
+    lr: float = 3e-4
     weight_decay: float = 1e-4
     max_steps: int = 2_000
-    warmup_steps: int = 1000
+    warmup_steps: int = 2000
     grad_clip: float = 1.0
     # Loss
     likelihood_weighting: bool = True  # λ(t) = σ(t)²

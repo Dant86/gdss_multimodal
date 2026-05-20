@@ -371,7 +371,8 @@ class ECGUNet(nn.Module):
         text_zero = torch.zeros(B, self.text_proj.in_features, device=ecg_t.device)
         cond = self._cond(t_emb, text_zero, lead_idx, r_peak_mask)
         h, _ = self._encode(ecg_t, cond)
-        return h.mean(dim=-1)
+        pooled = h.mean(dim=-1)
+        return nn.functional.normalize(pooled, dim=-1)
 
     def reconstruct(
         self,
