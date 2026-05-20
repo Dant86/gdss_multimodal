@@ -13,6 +13,49 @@ import config as cfg_module
 import modal_common
 
 
+def make_rpeak_mask(
+    n_samples: int,
+    heart_rate_bpm: float = 72.0,
+    seq_len: int = 1000,
+    fs: float = 100.0,
+    jitter_frac: float = 0.05,
+    device="cpu",
+) -> "torch.Tensor":
+    """Generate synthetic R-peak binary masks for conditional sampling.
+
+    Places R-peaks at evenly spaced intervals corresponding to the requested
+    heart rate, with a small random jitter (±jitter_frac × RR interval) and a
+    random phase offset so the first beat doesn't always land at sample 0.
+
+    Args:
+        n_samples: Batch size.
+        heart_rate_bpm: Desired heart rate in beats per minute (default 72).
+        seq_len: Sequence length (1000 for 10 s at 100 Hz).
+        fs: Sampling frequency in Hz.
+        jitter_frac: Jitter as a fraction of the RR interval (default 0.05 = ±5%).
+        device: Torch device.
+
+    Returns:
+        Float tensor of shape (n_samples, 1, seq_len) with 1.0 at R-peak positions.
+    """
+    import torch
+
+    rr = fs * 60.0 / heart_rate_bpm          # RR interval in samples
+    jitter = max(1, int(rr * jitter_frac))   # jitter in samples
+
+    masks = torch.zeros(n_samples, 1, seq_len, device=device)
+    for b in range(n_samples):
+        # Random phase offset: start anywhere in the first half-RR window
+        pos = float(torch.randint(0, max(1, int(rr / 2)), (1,)).item())
+        while pos < seq_len:
+            idx = int(round(pos))
+            if 0 <= idx < seq_len:
+                masks[b, 0, idx] = 1.0
+            j = float(torch.randint(-jitter, jitter + 1, (1,)).item())
+            pos += max(rr / 2, rr + j)
+    return masks
+
+
 def load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device):
     """Load trained ECGScoreNet and TextScoreNet from a checkpoint.
 
@@ -36,6 +79,7 @@ def load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device):
         channels=cfg.ecg_score.channels,
         bottleneck_ch=cfg.ecg_score.bottleneck_ch,
         lead_emb_dim=cfg.ecg_score.lead_emb_dim,
+        r_peak_enc_dim=cfg.ecg_score.r_peak_enc_dim,
     ).to(device)
     s_phi = models_module.TextScoreNet(
         text_dim=cfg.text_score.text_dim,
@@ -55,7 +99,7 @@ def load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device):
 
 
 def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps, snr, device, cfg,
-             lead_idx: int = 1):
+             lead_idx: int = 1, cfg_scale: float = 0.0, heart_rate_bpm: float = 72.0):
     """Run reverse diffusion to generate (ECG, text) pairs.
 
     Args:
@@ -71,6 +115,10 @@ def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps
         cfg: Experiment configuration.
         lead_idx: Which lead to generate (0–11). Default 1 = Lead II.
             Set to -1 to sample randomly across all 12 leads.
+        cfg_scale: Classifier-free guidance scale w ≥ 0. Score is computed as
+            (1+w)*score(lead=l) − w*score(lead=null). 0 disables CFG.
+        heart_rate_bpm: Heart rate used to generate synthetic R-peak masks at
+            inference time (default 72 bpm). Ignored if model has r_peak_enc_dim=0.
 
     Returns:
         Tuple of (ecg_array, text_array) as numpy arrays.
@@ -83,6 +131,7 @@ def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps
     sampler = solvers_module.SAMPLERS[sampler_name]
     all_ecg, all_text = [], []
     _use_lead_cond = cfg.ecg_score.lead_emb_dim > 0
+    _use_rpeak_cond = cfg.ecg_score.r_peak_enc_dim > 0
 
     generated = 0
     with torch.no_grad():
@@ -97,11 +146,21 @@ def generate(s_theta, s_phi, vpsde, sampler_name, n_samples, batch_size, n_steps
             else:
                 lidx = None
 
-            def score_ecg(m1, m2, t, _lidx=lidx):
-                return s_theta(m1, m2, t, _lidx)
+            rpmask = (
+                make_rpeak_mask(B, heart_rate_bpm, cfg.ecg_score.seq_len, device=device)
+                if _use_rpeak_cond else None
+            )
 
-            def score_text(m2, m1, t, _lidx=lidx):
-                h = s_theta.encode(m1, s_theta.t_embed(t), _lidx)
+            def score_ecg(m1, m2, t, _lidx=lidx, _rp=rpmask):
+                cond = s_theta(m1, m2, t, _lidx, _rp)
+                if cfg_scale > 0.0 and _lidx is not None:
+                    null_lidx = torch.full_like(_lidx, -1)
+                    uncond = s_theta(m1, m2, t, null_lidx, _rp)
+                    return (1.0 + cfg_scale) * cond - cfg_scale * uncond
+                return cond
+
+            def score_text(m2, m1, t, _lidx=lidx, _rp=rpmask):
+                h = s_theta.encode(m1, s_theta.t_embed(t), _lidx, _rp)
                 return s_phi(m2, h, t)
 
             m1_T = torch.randn(B, cfg.ecg_score.n_leads, cfg.ecg_score.seq_len, device=device)
@@ -130,6 +189,8 @@ def sample_on_modal(
     batch_size=32,
     corrector_snr=0.16,
     lead_idx=1,
+    cfg_scale=0.0,
+    heart_rate_bpm=72.0,
 ):
     """Modal entry point for sample generation.
 
@@ -157,7 +218,7 @@ def sample_on_modal(
     s_theta, s_phi = load_models(Path(modal_common.REMOTE_CKPTS) / f"{checkpoint}.pt", cfg, device)
     ecgs, texts = generate(
         s_theta, s_phi, vpsde, sampler, n_samples, batch_size, n_steps, corrector_snr, device, cfg,
-        lead_idx=lead_idx,
+        lead_idx=lead_idx, cfg_scale=cfg_scale, heart_rate_bpm=heart_rate_bpm,
     )
 
     out = Path(modal_common.REMOTE_SAMPLES)
@@ -178,6 +239,8 @@ def main(
     batch_size: int = 32,
     corrector_snr: float = 0.16,
     lead_idx: int = 1,
+    cfg_scale: float = 0.0,
+    heart_rate_bpm: float = 72.0,
 ):
     sample_on_modal.remote(
         checkpoint=checkpoint,
@@ -187,6 +250,8 @@ def main(
         batch_size=batch_size,
         corrector_snr=corrector_snr,
         lead_idx=lead_idx,
+        cfg_scale=cfg_scale,
+        heart_rate_bpm=heart_rate_bpm,
     )
 
 

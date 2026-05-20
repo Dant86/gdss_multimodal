@@ -174,6 +174,42 @@ class _Up1D(nn.Module):
         return self.res(h, cond)
 
 
+class _RPeakEncoder(nn.Module):
+    """Encodes a binary R-peak mask (B, 1, seq_len) to a conditioning vector (B, enc_dim).
+
+    Lightweight 1D CNN with two stride-4 downsampling layers and global average
+    pooling.  The sparse binary mask is compressed into a compact representation
+    that captures heart rate, rhythm regularity, and beat-phase.
+
+    Args:
+        enc_dim: Output dimensionality of the encoder.
+    """
+
+    def __init__(self, enc_dim: int = 64) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=9, padding=4),
+            nn.SiLU(),
+            nn.Conv1d(32, 64, kernel_size=7, stride=4, padding=3),    # L → L/4
+            nn.SiLU(),
+            nn.Conv1d(64, enc_dim, kernel_size=7, stride=4, padding=3),  # L/4 → L/16
+            nn.SiLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+        )
+
+    def forward(self, mask: torch.Tensor) -> torch.Tensor:
+        """Encode a binary R-peak mask.
+
+        Args:
+            mask: Float tensor of shape (B, 1, seq_len) with 1.0 at R-peak positions.
+
+        Returns:
+            Encoding of shape (B, enc_dim).
+        """
+        return self.net(mask)
+
+
 class ECGUNet(nn.Module):
     """s_θ(M1_t, M2_t, t) — ECG score network.
 
@@ -203,6 +239,7 @@ class ECGUNet(nn.Module):
         channels: tuple = (32, 64, 128),
         bottleneck_ch: int = 256,
         lead_emb_dim: int = 64,
+        r_peak_enc_dim: int = 64,
     ) -> None:
         super().__init__()
         self.n_leads = n_leads
@@ -223,6 +260,14 @@ class ECGUNet(nn.Module):
             cond_dim = timestep_dim * 3   # time | text | lead
         else:
             cond_dim = timestep_dim * 2   # time | text
+
+        # R-peak conditioning: 1D-CNN encodes binary heartbeat mask → enc_dim vector
+        # injected into every FiLM layer alongside time/text/lead.
+        # Setting r_peak_enc_dim=0 disables this.
+        self._r_peak_enc_dim = r_peak_enc_dim
+        if r_peak_enc_dim > 0:
+            self.rpeak_encoder = _RPeakEncoder(r_peak_enc_dim)
+            cond_dim += r_peak_enc_dim
 
         self.input_conv = nn.Conv1d(n_leads, channels[0], 3, padding=1)
         self.input_res = _ResBlock1D(channels[0], cond_dim)
@@ -253,15 +298,36 @@ class ECGUNet(nn.Module):
         t_emb: torch.Tensor,
         text_t: torch.Tensor,
         lead_idx: torch.Tensor | None = None,
+        r_peak_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Concatenate timestep, text, and (optionally) lead conditioning."""
+        """Concatenate timestep, text, lead, and R-peak conditioning.
+
+        Args:
+            t_emb: Sinusoidal timestep embedding (B, timestep_dim).
+            text_t: Noisy text embedding (B, text_dim).
+            lead_idx: Lead indices (B,), values 0–11; -1 is CFG sentinel (zeroed).
+            r_peak_mask: Binary R-peak mask (B, 1, seq_len); None or all-zeros = unconditional.
+        """
         parts = [t_emb, nn.functional.silu(self.text_proj(text_t))]
         if self._lead_emb_dim > 0:
             if lead_idx is not None:
-                parts.append(nn.functional.silu(self.lead_proj(self.lead_embed(lead_idx))))
+                # Support CFG sentinel: lead_idx == -1 → zero the lead slot for that sample.
+                # Clamp to 0 for the embedding lookup, then mask out dropped samples.
+                valid_idx = lead_idx.clamp(min=0)
+                raw_emb = self.lead_embed(valid_idx)
+                if (lead_idx < 0).any():
+                    keep = (lead_idx >= 0).to(raw_emb.dtype).unsqueeze(-1)
+                    raw_emb = raw_emb * keep
+                parts.append(nn.functional.silu(self.lead_proj(raw_emb)))
             else:
                 # No lead provided — zero-fill the lead slot so cond_dim is consistent
                 parts.append(torch.zeros(t_emb.shape[0], self._text_proj_dim,
+                                         device=t_emb.device, dtype=t_emb.dtype))
+        if self._r_peak_enc_dim > 0:
+            if r_peak_mask is not None:
+                parts.append(self.rpeak_encoder(r_peak_mask.to(t_emb.dtype)))
+            else:
+                parts.append(torch.zeros(t_emb.shape[0], self._r_peak_enc_dim,
                                          device=t_emb.device, dtype=t_emb.dtype))
         return torch.cat(parts, dim=-1)
 
@@ -283,24 +349,27 @@ class ECGUNet(nn.Module):
         ecg_t: torch.Tensor,
         t_emb: torch.Tensor,
         lead_idx: torch.Tensor | None = None,
+        r_peak_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Mean-pool bottleneck for cross-modal text conditioning.
 
         Text is zeroed out here because encode() is called from the text score
         network to extract the ECG representation — no text is available.  Lead
-        identity is passed through so the bottleneck is lead-aware.
+        identity and R-peak mask are passed through so the bottleneck is fully
+        conditioned.
 
         Args:
             ecg_t: Noisy ECG of shape (B, n_leads, seq_len).
             t_emb: Timestep embedding of shape (B, timestep_dim).
             lead_idx: Optional lead indices of shape (B,), values in 0–11.
+            r_peak_mask: Optional R-peak mask of shape (B, 1, seq_len).
 
         Returns:
             Pooled bottleneck of shape (B, bottleneck_ch).
         """
         B = ecg_t.shape[0]
         text_zero = torch.zeros(B, self.text_proj.in_features, device=ecg_t.device)
-        cond = self._cond(t_emb, text_zero, lead_idx)
+        cond = self._cond(t_emb, text_zero, lead_idx, r_peak_mask)
         h, _ = self._encode(ecg_t, cond)
         return h.mean(dim=-1)
 
@@ -308,15 +377,17 @@ class ECGUNet(nn.Module):
         self,
         ecg: torch.Tensor,
         lead_idx: torch.Tensor | None = None,
+        r_peak_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reconstruct ECG with zero time/text conditioning (autoencoder pretraining).
 
-        Lead identity IS passed through (if provided) so the model learns
-        lead-specific morphology during pretraining.
+        Lead identity and R-peak mask are passed through so the model learns
+        lead-specific morphology and beat-phase structure during pretraining.
 
         Args:
             ecg: Clean ECG of shape (B, n_leads, seq_len).
             lead_idx: Optional lead indices of shape (B,), values in 0–11.
+            r_peak_mask: Optional R-peak mask of shape (B, 1, seq_len).
 
         Returns:
             Reconstruction of the same shape.
@@ -324,7 +395,7 @@ class ECGUNet(nn.Module):
         B = ecg.shape[0]
         t_zero = torch.zeros(B, self._text_proj_dim, device=ecg.device, dtype=ecg.dtype)
         text_zero = torch.zeros(B, self.text_proj.in_features, device=ecg.device, dtype=ecg.dtype)
-        cond = self._cond(t_zero, text_zero, lead_idx)
+        cond = self._cond(t_zero, text_zero, lead_idx, r_peak_mask)
         h, skips = self._encode(ecg, cond)
         h = self.ups[0](h, skips[-1], cond)
         for i, up in enumerate(self.ups[1:]):
@@ -338,6 +409,7 @@ class ECGUNet(nn.Module):
         text_t: torch.Tensor,
         t: torch.Tensor,
         lead_idx: torch.Tensor | None = None,
+        r_peak_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Estimate the score of the ECG marginal at time t.
 
@@ -346,12 +418,13 @@ class ECGUNet(nn.Module):
             text_t: Noisy text embedding of shape (B, text_dim).
             t: Timesteps of shape (B,).
             lead_idx: Optional lead indices of shape (B,), values in 0–11.
+            r_peak_mask: Optional R-peak mask of shape (B, 1, seq_len).
 
         Returns:
             Score estimate of shape (B, n_leads, seq_len).
         """
         t_emb = self.t_embed(t)
-        cond = self._cond(t_emb, text_t, lead_idx)
+        cond = self._cond(t_emb, text_t, lead_idx, r_peak_mask)
         h, skips = self._encode(ecg_t, cond)
         h = self.ups[0](h, skips[-1], cond)
         for i, up in enumerate(self.ups[1:]):

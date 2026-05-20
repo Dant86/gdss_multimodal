@@ -116,6 +116,7 @@ def pretrain(
         channels=ecfg.channels,
         bottleneck_ch=ecfg.bottleneck_ch,
         lead_emb_dim=ecfg.lead_emb_dim,
+        r_peak_enc_dim=ecfg.r_peak_enc_dim,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  ECGUNet params: {n_params / 1e6:.2f}M")
@@ -157,10 +158,11 @@ def pretrain(
 
         ecg = batch["ecg"].to(device)          # (B, 1, seq_len)
         lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
+        r_peak_mask = batch["r_peak_mask"].to(device) if "r_peak_mask" in batch else None
 
         optimiser.zero_grad()
         with autocast:
-            recon = model.reconstruct(ecg, lead_idx)
+            recon = model.reconstruct(ecg, lead_idx, r_peak_mask)
             mse = F.mse_loss(recon, ecg)
             spec = _spectral_loss(recon, ecg)
             loss = mse + pcfg.spectral_weight * spec

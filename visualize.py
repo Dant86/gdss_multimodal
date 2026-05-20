@@ -174,6 +174,7 @@ def _load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device: torch.de
         channels=cfg.ecg_score.channels,
         bottleneck_ch=cfg.ecg_score.bottleneck_ch,
         lead_emb_dim=cfg.ecg_score.lead_emb_dim,
+        r_peak_enc_dim=cfg.ecg_score.r_peak_enc_dim,
     ).to(device)
     s_phi = models_module.TextScoreNet(
         text_dim=cfg.text_score.text_dim,
@@ -211,6 +212,7 @@ def _generate(
     return sample_module.generate(
         s_theta, s_phi, vpsde, "s4", n,
         batch_size=min(64, n), n_steps=100, snr=0.16, device=device, cfg=cfg,
+        heart_rate_bpm=72.0,
     )
 
 
@@ -549,17 +551,20 @@ def visualize(
     timeout=1800,
     secrets=modal_common.HF_SECRETS,
 )
-def visualize_on_modal(checkpoint: str = "final", n_gen: int = 300) -> None:
+def visualize_on_modal(checkpoint: str = "final", n_gen: int = 300, tag: str = "") -> None:
     """Modal entry point for visualisation.
 
     Args:
         checkpoint: Checkpoint name stem (without .pt).
         n_gen: Number of samples to generate.
+        tag: Optional subdirectory tag under figures/ (e.g. "12lead_v1").
+            Keeps figures from different runs from overwriting each other.
     """
     import os
     os.environ["HF_HOME"] = modal_common.HF_CACHE_DIR
 
-    out_dir = f"{modal_common.REMOTE_SAMPLES}/figures"
+    base = f"{modal_common.REMOTE_SAMPLES}/figures"
+    out_dir = f"{base}/{tag}" if tag else base
     visualize(
         ckpt_path=f"{modal_common.REMOTE_CKPTS}/{checkpoint}.pt",
         data_dir=f"{modal_common.REMOTE_CACHE}/ptbxl",
@@ -574,8 +579,8 @@ def visualize_on_modal(checkpoint: str = "final", n_gen: int = 300) -> None:
 
 
 @modal_common.app.local_entrypoint(name="visualize")
-def modal_main(checkpoint: str = "final", n_gen: int = 300) -> None:
-    visualize_on_modal.remote(checkpoint=checkpoint, n_gen=n_gen)
+def modal_main(checkpoint: str = "final", n_gen: int = 300, tag: str = "") -> None:
+    visualize_on_modal.remote(checkpoint=checkpoint, n_gen=n_gen, tag=tag)
 
 
 # ── Local entrypoint ──────────────────────────────────────────────────────────

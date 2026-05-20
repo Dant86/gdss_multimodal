@@ -29,7 +29,8 @@ def _update_ema(ema: dict, model, decay: float = 0.9999) -> None:
             ema[k].mul_(decay).add_(v, alpha=1.0 - decay)
 
 
-def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True, lead_idx=None):
+def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True, lead_idx=None,
+             cfg_drop_prob: float = 0.0, r_peak_mask=None, r_peak_drop_prob: float = 0.0):
     """Compute joint denoising score matching loss.
 
     Args:
@@ -55,8 +56,26 @@ def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True, lead
     ecg_t = mean1 + std1 * eps1
     text_t = mean2 + std2 * eps2
 
-    score_ecg = s_theta(ecg_t, text_t, t, lead_idx)
-    score_text = s_phi(text_t, _ecg_rep(s_theta, ecg_t, text_t, t, lead_idx), t)
+    # Classifier-free guidance: randomly null the lead conditioning so the
+    # model also learns the lead-agnostic (unconditional) score.
+    import torch as _torch
+    cfg_lead = lead_idx
+    if lead_idx is not None and cfg_drop_prob > 0.0:
+        drop_mask = _torch.rand(B, device=device) < cfg_drop_prob
+        cfg_lead = lead_idx.clone()
+        cfg_lead[drop_mask] = -1   # sentinel → _cond will zero the lead slot
+
+    # R-peak CFG drop: zero out the mask for randomly chosen samples so the
+    # model also learns the R-peak-unconditional score.
+    r_peak_cond = r_peak_mask
+    if r_peak_mask is not None and r_peak_drop_prob > 0.0:
+        rp_drop = _torch.rand(B, device=device) < r_peak_drop_prob
+        if rp_drop.any():
+            r_peak_cond = r_peak_mask.clone()
+            r_peak_cond[rp_drop] = 0.0
+
+    score_ecg = s_theta(ecg_t, text_t, t, cfg_lead if cfg_lead is not None else lead_idx, r_peak_cond)
+    score_text = s_phi(text_t, _ecg_rep(s_theta, ecg_t, text_t, t, cfg_lead if cfg_lead is not None else lead_idx, r_peak_cond), t)
 
     shape1 = (-1,) + (1,) * (ecg0.dim() - 1)
     shape2 = (-1,) + (1,) * (text0.dim() - 1)
@@ -82,11 +101,11 @@ def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True, lead
     return loss_ecg.mean() + loss_text.mean()
 
 
-def _ecg_rep(s_theta, ecg_t, text_t, t, lead_idx=None):
+def _ecg_rep(s_theta, ecg_t, text_t, t, lead_idx=None, r_peak_mask=None):
     import torch
 
     with torch.no_grad():
-        h = s_theta.encode(ecg_t, s_theta.t_embed(t), lead_idx)
+        h = s_theta.encode(ecg_t, s_theta.t_embed(t), lead_idx, r_peak_mask)
     return h.detach()
 
 
@@ -143,6 +162,7 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
         channels=cfg.ecg_score.channels,
         bottleneck_ch=cfg.ecg_score.bottleneck_ch,
         lead_emb_dim=cfg.ecg_score.lead_emb_dim,
+        r_peak_enc_dim=cfg.ecg_score.r_peak_enc_dim,
     ).to(device)
     s_phi = models_module.TextScoreNet(
         text_dim=cfg.text_score.text_dim,
@@ -206,9 +226,15 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
         ecg0 = batch["ecg"].to(device)
         text0 = batch["text_emb"].to(device)
         lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
+        r_peak_mask = batch["r_peak_mask"].to(device) if "r_peak_mask" in batch else None
         optimiser.zero_grad()
         with autocast:
-            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting, lead_idx)
+            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting, lead_idx,
+                            cfg_drop_prob=cfg.train.cfg_drop_prob,
+                            r_peak_mask=r_peak_mask, r_peak_drop_prob=cfg.train.r_peak_drop_prob)
+        # Guard against rare catastrophic batches (bfloat16 small-t instability).
+        # clamp before backward so the gradient signal is also bounded.
+        loss = loss.clamp(max=50.0).nan_to_num(0.0)
         loss.backward()
         nn.utils.clip_grad_norm_(params, cfg.train.grad_clip)
         optimiser.step()
@@ -246,7 +272,9 @@ def _validate(s_theta, s_phi, loader, vpsde, device, cfg):
             ecg0 = batch["ecg"].to(device)
             text0 = batch["text_emb"].to(device)
             lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
-            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting, lead_idx)
+            r_peak_mask = batch["r_peak_mask"].to(device) if "r_peak_mask" in batch else None
+            loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting,
+                            lead_idx, r_peak_mask=r_peak_mask)
             total += loss.item() * ecg0.shape[0]
             count += ecg0.shape[0]
     s_theta.train()

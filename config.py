@@ -24,6 +24,9 @@ class ECGScoreConfig:
     # Lead identity conditioning: learned embedding injected into FiLM cond.
     # Set to 0 to disable (single-lead mode, no lead embedding).
     lead_emb_dim: int = 64
+    # R-peak conditioning: small 1D-CNN encoder output dim injected into FiLM.
+    # Set to 0 to disable.
+    r_peak_enc_dim: int = 64
 
 
 @dataclass
@@ -68,6 +71,12 @@ class TrainConfig:
     grad_clip: float = 1.0
     # Loss
     likelihood_weighting: bool = True  # λ(t) = σ(t)²
+    # Classifier-free guidance: probability of zeroing lead conditioning per sample.
+    # Set to 0 to disable CFG (default). Typical value: 0.10–0.15.
+    cfg_drop_prob: float = 0.10
+    # R-peak CFG drop: probability of zeroing R-peak mask per sample during training
+    # so the model also learns the R-peak-unconditional score.
+    r_peak_drop_prob: float = 0.10
     # Logging
     log_every: int = 500
     val_every: int = 500
