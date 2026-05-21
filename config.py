@@ -19,21 +19,21 @@ class ECGScoreConfig:
     seq_len: int = 1000
     # U-Net architecture
     timestep_dim: int = 128
-    channels: tuple = (64, 128, 256)
-    bottleneck_ch: int = 512
+    channels: tuple = (128, 256, 512)
+    bottleneck_ch: int = 1024
     # Lead identity conditioning: learned embedding injected into FiLM cond.
     # Set to 0 to disable (single-lead mode, no lead embedding).
     lead_emb_dim: int = 64
     # R-peak conditioning: small 1D-CNN encoder output dim injected into FiLM.
     # Set to 0 to disable.
-    r_peak_enc_dim: int = 64
+    r_peak_enc_dim: int = 0
 
 
 @dataclass
 class TextScoreConfig:
     text_dim: int = 768
     # Must match ECGScoreConfig.bottleneck_ch
-    moment_hidden_dim: int = 512
+    moment_hidden_dim: int = 1024
     timestep_embed_dim: int = 256
     hidden_dim: int = 1024
     n_layers: int = 6
@@ -61,8 +61,8 @@ class TrainConfig:
     # Data
     data_dir: str = "data/ptbxl"   # PhysioNet PTB-XL root (contains ptbxl_database.csv)
     data_cache_dir: str = "cache"  # BERT embeddings + ECG stats
-    batch_size: int = 256
-    num_workers: int = 0
+    batch_size: int = 512
+    num_workers: int = 4
     # Optimization
     lr: float = 3e-4
     weight_decay: float = 1e-4
@@ -79,7 +79,7 @@ class TrainConfig:
     r_peak_drop_prob: float = 0.10
     # Logging
     log_every: int = 500
-    val_every: int = 500
+    val_every: int = 1000
     save_every: int = 5000
     checkpoint_dir: str = "checkpoints"
     # Device

@@ -223,7 +223,7 @@ def _run_one_cell(sampler_name, nfe, s_theta, s_phi, vpsde, real_ecgs, real_text
     gen_ecgs, gen_texts = sample_module.generate(
         s_theta, s_phi, vpsde, sampler_name, n_samples,
         cfg.eval.batch_size, nfe, cfg.eval.sampler.corrector_snr, device, cfg,
-        lead_idx=lead_idx,
+        lead_idx=lead_idx, cfg_scale=1.5,
     )
     fid = ecg_fid(real_ecgs, gen_ecgs, device)
     cos = text_cosine_sim(gen_texts, real_texts)
@@ -242,6 +242,71 @@ def print_ablation_table(results: dict) -> None:
     print("\n" + hdr + "\n" + "-" * len(hdr))
     for (s, n), m in sorted(results.items()):
         print(f"{s:>8} {n:>6} {m['fid']:>10.2f} {m['cos_sim']:>10.4f} {m['joint_quality']:>10.4f}")
+
+
+def plot_fid_bar(results: dict, out_path: str) -> None:
+    """Save a grouped bar chart of FID scores by sampler and NFE.
+
+    Args:
+        results: Dict mapping (sampler_name, nfe) → metrics dict with 'fid' key.
+        out_path: File path to write the PNG.
+    """
+    import plotly.graph_objects as go
+    from pathlib import Path
+
+    _BG   = "#FFFFFF"
+    _DARK = "#1A1A1A"
+    _GRID = "#EEEEEE"
+    _GRAY3 = "#AAAAAA"
+    _FONT = "Fira Sans, Helvetica Neue, Arial, sans-serif"
+    _COLORS = ["#C0392B", "#7F8C8D", "#CC8800", "#005555", "#2C3E50", "#8E44AD"]
+
+    # Group by sampler
+    samplers = sorted(set(s for s, _ in results))
+    nfes = sorted(set(n for _, n in results))
+
+    fig = go.Figure()
+    for i, sampler in enumerate(samplers):
+        fids = [results.get((sampler, n), {}).get("fid", None) for n in nfes]
+        fig.add_trace(go.Bar(
+            name=sampler.upper(),
+            x=nfes,
+            y=fids,
+            marker_color=_COLORS[i % len(_COLORS)],
+            marker_line_color=_DARK,
+            marker_line_width=0.8,
+        ))
+
+    fig.update_layout(
+        paper_bgcolor=_BG,
+        plot_bgcolor=_BG,
+        font=dict(family=_FONT, color=_DARK, size=13),
+        margin=dict(l=70, r=30, t=20, b=65),
+        barmode="group",
+        width=700,
+        height=450,
+        xaxis=dict(
+            title_text="NFE",
+            type="category",
+            categoryorder="array",
+            categoryarray=[str(n) for n in nfes],
+            tickvals=nfes,
+            ticktext=[str(n) for n in nfes],
+            showgrid=False, linecolor=_GRAY3, linewidth=1, showline=True,
+            ticks="outside", tickcolor=_GRAY3,
+        ),
+        yaxis=dict(
+            title_text="FID ↓",
+            showgrid=True, gridcolor=_GRID, gridwidth=1,
+            zeroline=False, linecolor=_GRAY3, linewidth=1, showline=True,
+            ticks="outside", tickcolor=_GRAY3,
+        ),
+        legend=dict(bgcolor=_BG, bordercolor=_GRID, borderwidth=1, font=dict(size=12)),
+    )
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.write_image(str(out_path), scale=2)
+    print(f"  FID bar chart saved → {out_path}")
 
 
 @modal_common.app.function(
@@ -303,7 +368,7 @@ def main(
     n_samples: int = 1000,
     corrector_snr: float = 0.16,
     nfe: str = "100,500,1000",
-    samplers: str = "s4,pc,em",
+    samplers: str = "pc,s4,em",
     lead_idx: int = 1,
 ):
     nfe_list = [int(n) for n in nfe.split(",")]
@@ -318,6 +383,9 @@ def main(
     for sampler_name, nfe_val, metrics in eval_one_cell.starmap(cells):
         results[(sampler_name, nfe_val)] = metrics
     print_ablation_table(results)
+    # Save bar chart locally (local_entrypoint runs on the client machine)
+    fig_path = Path("figures") / checkpoint / "fid_bar.png"
+    plot_fid_bar(results, fig_path)
 
 
 if __name__ == "__main__":
@@ -362,3 +430,4 @@ if __name__ == "__main__":
                 real_ecgs, real_texts, real_labels, classifier, device, cfg, args.n_samples,
             )
     print_ablation_table(results)
+    plot_fid_bar(results, Path(args.checkpoint_dir) / f"fid_bar_{args.checkpoint}.png")

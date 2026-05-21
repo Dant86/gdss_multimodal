@@ -239,7 +239,7 @@ def _seed(seed: int) -> None:
 )
 def pretrain_on_modal(
     max_steps: int = 30_000,
-    batch_size: int = 256,
+    batch_size: int = 512,
     lr: float = 1e-3,
     spectral_weight: float = 0.1,
     resume: str = "",
@@ -280,7 +280,7 @@ def pretrain_on_modal(
 @modal_common.app.local_entrypoint(name="pretrain")
 def main(
     max_steps: int = 30_000,
-    batch_size: int = 256,
+    batch_size: int = 512,
     lr: float = 1e-3,
     spectral_weight: float = 0.1,
     resume: str = "",

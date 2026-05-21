@@ -59,7 +59,7 @@ def _layout(**kw) -> dict:
         paper_bgcolor=_BG,
         plot_bgcolor=_BG,
         font=dict(family=_FONT, color=_DARK, size=13),
-        margin=dict(l=70, r=30, t=55, b=65),
+        margin=dict(l=70, r=30, t=20, b=65),
     )
     base.update(kw)
     return base
@@ -193,9 +193,10 @@ def _load_models(ckpt_path: str | Path, cfg: cfg_module.Config, device: torch.de
 
 
 def _generate(
-    s_theta, s_phi, vpsde, n: int, cfg: cfg_module.Config, device
+    s_theta, s_phi, vpsde, n: int, cfg: cfg_module.Config, device,
+    sampler: str = "pc", n_steps: int = 500,
 ) -> tuple[numpy.ndarray, numpy.ndarray]:
-    """Generate n (ECG, text_emb) pairs with the S4 sampler.
+    """Generate n (ECG, text_emb) pairs.
 
     Args:
         s_theta: ECG score network.
@@ -204,15 +205,17 @@ def _generate(
         n: Number of samples to generate.
         cfg: Experiment configuration.
         device: Torch device.
+        sampler: Sampler name — "pc", "s4", or "em". Default "pc".
+        n_steps: Number of reverse diffusion steps. Default 500.
 
     Returns:
         Tuple of (ecgs, text_embs) as numpy arrays.
     """
     import sample as sample_module
     return sample_module.generate(
-        s_theta, s_phi, vpsde, "s4", n,
-        batch_size=min(64, n), n_steps=100, snr=0.16, device=device, cfg=cfg,
-        heart_rate_bpm=72.0,
+        s_theta, s_phi, vpsde, sampler, n,
+        batch_size=min(64, n), n_steps=n_steps, snr=0.16, device=device, cfg=cfg,
+        cfg_scale=1.5, heart_rate_bpm=72.0,
     )
 
 
@@ -304,11 +307,6 @@ def plot_waveforms(
             ), row=row, col=2)
 
     fig.update_layout(**_layout(
-        title=dict(
-            text="Real vs Generated ECGs by Diagnosis",
-            font=dict(size=15, color=_DARK),
-            x=0.5, xanchor="center",
-        ),
         height=210 * n_classes,
         width=1100,
     ))
@@ -379,11 +377,6 @@ def plot_psd(
             ))
 
     fig.update_layout(**_layout(
-        title=dict(
-            text="Power Spectral Density — Real (—) vs Generated (- -)",
-            font=dict(size=15),
-            x=0.5, xanchor="center",
-        ),
         width=950, height=500,
         xaxis=_axis(title_text="Frequency (Hz)", range=[0, 50]),
         yaxis=_axis(title_text="Power (dB)"),
@@ -475,14 +468,9 @@ def plot_text_neighbors(
     )])
 
     fig.update_layout(**_layout(
-        title=dict(
-            text="Generated Text Embedding → Nearest Real Report",
-            font=dict(size=15),
-            x=0.5, xanchor="center",
-        ),
         width=900,
         height=90 + 32 * len(col_class),
-        margin=dict(l=20, r=20, t=55, b=20),
+        margin=dict(l=20, r=20, t=20, b=20),
     ))
 
     path = out_dir / "text_neighbors.png"
@@ -501,6 +489,8 @@ def visualize(
     n_real: int = 400,
     n_gen: int = 300,
     device_str: str = "cpu",
+    sampler: str = "pc",
+    n_steps: int = 500,
 ) -> None:
     """Run all three visualisations and write PNGs to out_dir.
 
@@ -512,6 +502,8 @@ def visualize(
         n_real: Number of real ECGs to sample for comparison.
         n_gen: Number of ECG pairs to generate.
         device_str: Torch device string.
+        sampler: Sampler name — "pc", "s4", or "em". Default "pc".
+        n_steps: Number of reverse diffusion steps. Default 500.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -527,8 +519,9 @@ def visualize(
     vpsde = sde_module.VPSDE(cfg.sde.beta_min, cfg.sde.beta_max, cfg.sde.T, cfg.sde.eps)
     s_theta, s_phi = _load_models(ckpt_path, cfg, device)
 
-    print(f"Generating {n_gen} samples…")
-    gen_ecgs, gen_texts = _generate(s_theta, s_phi, vpsde, n_gen, cfg, device)
+    print(f"Generating {n_gen} samples with {sampler.upper()} NFE={n_steps}…")
+    gen_ecgs, gen_texts = _generate(s_theta, s_phi, vpsde, n_gen, cfg, device,
+                                    sampler=sampler, n_steps=n_steps)
 
     print("Assigning labels via text nearest-neighbour…")
     gen_labels = _assign_labels(gen_texts, real_texts, real_labels)
@@ -551,7 +544,13 @@ def visualize(
     timeout=1800,
     secrets=modal_common.HF_SECRETS,
 )
-def visualize_on_modal(checkpoint: str = "final", n_gen: int = 300, tag: str = "") -> None:
+def visualize_on_modal(
+    checkpoint: str = "final",
+    n_gen: int = 128,
+    tag: str = "",
+    sampler: str = "pc",
+    n_steps: int = 500,
+) -> None:
     """Modal entry point for visualisation.
 
     Args:
@@ -559,6 +558,8 @@ def visualize_on_modal(checkpoint: str = "final", n_gen: int = 300, tag: str = "
         n_gen: Number of samples to generate.
         tag: Optional subdirectory tag under figures/ (e.g. "12lead_v1").
             Keeps figures from different runs from overwriting each other.
+        sampler: Sampler name — "pc", "s4", or "em". Default "pc".
+        n_steps: Number of reverse diffusion steps. Default 500.
     """
     import os
     os.environ["HF_HOME"] = modal_common.HF_CACHE_DIR
@@ -573,14 +574,23 @@ def visualize_on_modal(checkpoint: str = "final", n_gen: int = 300, tag: str = "
         n_real=400,
         n_gen=n_gen,
         device_str="cuda",
+        sampler=sampler,
+        n_steps=n_steps,
     )
     modal_common.samples_vol.commit()
     print(f"Figures saved to {out_dir}")
 
 
 @modal_common.app.local_entrypoint(name="visualize")
-def modal_main(checkpoint: str = "final", n_gen: int = 300, tag: str = "") -> None:
-    visualize_on_modal.remote(checkpoint=checkpoint, n_gen=n_gen, tag=tag)
+def modal_main(
+    checkpoint: str = "final",
+    n_gen: int = 128,
+    tag: str = "",
+    sampler: str = "pc",
+    n_steps: int = 500,
+) -> None:
+    visualize_on_modal.remote(checkpoint=checkpoint, n_gen=n_gen, tag=tag,
+                               sampler=sampler, n_steps=n_steps)
 
 
 # ── Local entrypoint ──────────────────────────────────────────────────────────

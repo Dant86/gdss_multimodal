@@ -38,6 +38,8 @@ base_image = (
         "nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04",
         add_python="3.11",
     )
+    # gcc is required by Triton (torch.compile JIT kernel compilation)
+    .run_commands("apt-get update -q && apt-get install -y --no-install-recommends gcc g++ && rm -rf /var/lib/apt/lists/*")
     .pip_install(
         "torch==2.4.0+cu121",
         "torchvision==0.19.0+cu121",
@@ -96,4 +98,4 @@ try:
 except Exception:
     HF_SECRETS = []
 
-GPU = "H200"
+GPU = "H200:2"

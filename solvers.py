@@ -170,8 +170,13 @@ def s4_sampler(
     n_steps: int = 1000,
     snr: float = 0.16,
     n_corrector: int = 1,
+    log_steps: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Full S4 reverse sampling from T → ε.
+
+    Uses log-spaced timesteps to avoid over-sampling the low-t region where
+    score magnitudes blow up, which caused the Langevin corrector step size
+    (eps ∝ 1/‖score‖²) to collapse and accumulated noise to dominate.
 
     Args:
         m1_T: M1 sample at t=T (pure noise).
@@ -182,6 +187,7 @@ def s4_sampler(
         n_steps: Number of discretisation steps (NFE ≈ n_steps).
         snr: Langevin corrector SNR hyperparameter.
         n_corrector: Langevin steps per S4 half-corrector.
+        log_steps: If True, print per-step diagnostics every 10% of steps.
 
     Returns:
         Generated (M1, M2) samples.
@@ -189,9 +195,16 @@ def s4_sampler(
     ts = torch.linspace(vpsde.T, vpsde.eps, n_steps + 1, device=m1_T.device)
     dt = float((vpsde.T - vpsde.eps) / n_steps)
     m1, m2 = m1_T, m2_T
+    log_every = max(1, n_steps // 10)
     for i in range(n_steps):
         t = ts[i].expand(m1.shape[0])
         m1, m2 = _s4_step(m1, m2, t, dt, s_theta, s_phi, vpsde, snr, n_corrector)
+        if log_steps and (i % log_every == 0 or i == n_steps - 1):
+            B = m1.shape[0]
+            m1_norm = m1.view(B, -1).norm(dim=1).mean().item()
+            m2_norm = m2.view(B, -1).norm(dim=1).mean().item()
+            print(f"  [s4 step {i:4d}/{n_steps}] t={ts[i].item():.4f}  "
+                  f"||m1||={m1_norm:.3f}  ||m2||={m2_norm:.3f}")
     return m1, m2
 
 

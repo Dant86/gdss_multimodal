@@ -15,17 +15,34 @@ import config as cfg_module
 import modal_common
 
 
+def _unwrap(model):
+    """Return the underlying module, stripping DataParallel or DDP wrappers."""
+    import torch.nn as nn
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    return model.module if isinstance(model, (nn.DataParallel, DDP)) else model
+
+
+def _try_commit_volume(step: int) -> None:
+    """Commit the Modal checkpoint volume from rank-0 worker (no-op locally)."""
+    try:
+        import modal_common as _mc
+        print(f"  committing checkpoint volume at step {step}…")
+        _mc.ckpt_vol.commit()
+    except Exception:
+        pass
+
+
 def _init_ema(model) -> dict:
     """Initialise an EMA shadow as a clone of the current state dict."""
     import torch
-    return {k: v.clone() for k, v in model.state_dict().items()}
+    return {k: v.clone() for k, v in _unwrap(model).state_dict().items()}
 
 
 def _update_ema(ema: dict, model, decay: float = 0.9999) -> None:
     """Update EMA shadow in-place: shadow = decay·shadow + (1−decay)·param."""
     import torch
     with torch.no_grad():
-        for k, v in model.state_dict().items():
+        for k, v in _unwrap(model).state_dict().items():
             ema[k].mul_(decay).add_(v, alpha=1.0 - decay)
 
 
@@ -104,17 +121,45 @@ def dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, likelihood_weighting=True, lead
 def _ecg_rep(s_theta, ecg_t, text_t, t, lead_idx=None, r_peak_mask=None):
     import torch
 
+    m = _unwrap(s_theta)
     with torch.no_grad():
-        h = s_theta.encode(ecg_t, s_theta.t_embed(t), lead_idx, r_peak_mask)
+        h = m.encode(ecg_t, m.t_embed(t), lead_idx, r_peak_mask)
     return h.detach()
 
 
 def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]] = None) -> None:
-    """Run the full training loop.
+    """Run the full training loop, using DDP when multiple GPUs are present.
 
     Args:
         cfg: Experiment configuration.
-        on_checkpoint: Optional callback invoked after each checkpoint save.
+        on_checkpoint: Callback invoked after each checkpoint save (single-GPU only;
+            in DDP mode rank-0 commits the Modal volume directly via _try_commit_volume).
+    """
+    import torch
+    import os
+
+    use_cuda = cfg.train.device == "cuda" and torch.cuda.is_available()
+    world_size = torch.cuda.device_count() if use_cuda else 1
+
+    if world_size > 1:
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", "12355")
+        import torch.multiprocessing as mp
+        mp.spawn(_train_worker, args=(world_size, cfg), nprocs=world_size, join=True)
+    else:
+        _train_worker(0, 1, cfg, on_checkpoint=on_checkpoint)
+
+
+def _train_worker(
+    rank: int,
+    world_size: int,
+    cfg: cfg_module.Config,
+    on_checkpoint: Optional[Callable[[int], None]] = None,
+) -> None:
+    """Per-process training worker (runs on a single GPU).
+
+    In single-GPU mode rank=0, world_size=1 and on_checkpoint is forwarded normally.
+    In DDP mode each GPU runs this in its own process; rank-0 handles all I/O.
     """
     import time
 
@@ -128,32 +173,56 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
     import models as models_module
     import sde as sde_module
 
-    device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
-    _seed(cfg.train.seed)
+    # ── Distributed setup ────────────────────────────────────────────────────
+    ddp = world_size > 1
+    if ddp:
+        import torch.distributed as dist
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        from torch.utils.data import DistributedSampler
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
 
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    is_main = rank == 0   # only this rank prints, saves, and validates
+
+    if is_main:
+        torch.backends.cudnn.benchmark = True  # fast conv kernels for fixed-size inputs
+
+    _seed(cfg.train.seed + rank)  # different seed per worker for data diversity
+
+    # ── Data ─────────────────────────────────────────────────────────────────
     multi_lead = cfg.ecg_score.lead_emb_dim > 0
-    print(f"Loading datasets… (multi_lead={multi_lead})")
+    if is_main:
+        print(f"Loading datasets… (multi_lead={multi_lead})")
     train_ds, val_ds, _ = data_module.build_datasets(
         cfg.train.data_dir, cfg.train.data_cache_dir,
-        bert_device=cfg.train.device, multi_lead=multi_lead,
+        bert_device=f"cuda:{rank}" if torch.cuda.is_available() else "cpu",
+        multi_lead=multi_lead,
     )
+
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank,
+                                       shuffle=True, drop_last=True) if ddp else None
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.train.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=cfg.train.num_workers,
         pin_memory=True,
         drop_last=True,
     )
+    # Validation only on rank 0
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.train.batch_size,
         shuffle=False,
         num_workers=cfg.train.num_workers,
         pin_memory=True,
-    )
+    ) if is_main else None
 
-    print("Building models…")
+    # ── Models ───────────────────────────────────────────────────────────────
+    if is_main:
+        print("Building models…")
     s_theta = models_module.ECGUNet(
         text_dim=cfg.ecg_score.text_dim,
         n_leads=cfg.ecg_score.n_leads,
@@ -173,51 +242,43 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
     ).to(device)
     vpsde = sde_module.VPSDE(cfg.sde.beta_min, cfg.sde.beta_max, cfg.sde.T, cfg.sde.eps)
 
+    # ── Pretrain / resume ────────────────────────────────────────────────────
     if cfg.train.pretrain_checkpoint:
         ckpt_path = Path(cfg.train.pretrain_checkpoint)
-        print(f"Loading pretrained ECGUNet weights from {ckpt_path}…")
+        if is_main:
+            print(f"Loading pretrained ECGUNet weights from {ckpt_path}…")
         state = torch.load(ckpt_path, map_location=device)
-        missing, unexpected = s_theta.load_state_dict(state["s_theta"], strict=False)
-        if missing:
-            print(f"  missing keys: {missing}")
-        if unexpected:
-            print(f"  unexpected keys: {unexpected}")
-        print("  pretrained weights loaded.")
-
-        # Reinitialise FiLM output layers to identity (γ=1, β=0).
-        #
-        # During pretraining the time and text conditioning slots are always
-        # zero (t=0, text=zeros passed to reconstruct()).  FiLM therefore
-        # never sees non-zero signal from those 256 of 448 cond_dim dims and
-        # accumulates random or zero weights for them.  When DSM training
-        # first activates the time and text slots, those random weights
-        # produce enormous outputs → loss >> 50 → loss clamp zeros ALL
-        # gradients → the model is completely stuck.
-        #
-        # Fix: reset every FiLM output projection to the identity map so
-        # every block starts as h′ = 1·h + 0 regardless of what cond_dim
-        # carries.  The conv backbone's ECG-morphology knowledge is preserved;
-        # only the conditioning pathway is restarted from a safe prior.
-        _n_film = 0
-        for module in s_theta.modules():
-            if isinstance(module, models_module.FiLM):
-                last = module.net[-1]
-                nn.init.zeros_(last.weight)
-                half = last.out_features // 2
-                nn.init.constant_(last.bias[:half], 1.0)   # gamma initialised to 1
-                nn.init.zeros_(last.bias[half:])            # beta  initialised to 0
-                _n_film += 1
-        print(f"  {_n_film} FiLM output layers reset to identity (gamma=1, beta=0).")
+        current_sd = s_theta.state_dict()
+        filtered = {
+            k: v for k, v in state["s_theta"].items()
+            if k in current_sd and current_sd[k].shape == v.shape
+        }
+        skipped = [k for k in state["s_theta"] if k not in filtered]
+        s_theta.load_state_dict(filtered, strict=False)
+        if is_main:
+            print(f"  pretrained weights loaded ({len(filtered)} matched, {len(skipped)} skipped).")
+            if skipped:
+                print(f"  skipped keys: {skipped[:5]}{'…' if len(skipped) > 5 else ''}")
 
     if cfg.train.resume_checkpoint:
         ckpt_path = Path(cfg.train.resume_checkpoint)
-        print(f"Resuming from training checkpoint {ckpt_path} (EMA weights, fresh optimiser)…")
+        if is_main:
+            print(f"Resuming from {ckpt_path} (EMA weights, fresh optimiser)…")
         state = torch.load(ckpt_path, map_location=device)
-        # Prefer EMA weights — they are smoother than the final training weights
         s_theta.load_state_dict(state.get("s_theta_ema", state["s_theta"]))
         s_phi.load_state_dict(state.get("s_phi_ema", state["s_phi"]))
-        print("  resumed.")
+        if is_main:
+            print("  resumed.")
 
+    # ── DDP ──────────────────────────────────────────────────────────────────
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        s_theta = DDP(s_theta, device_ids=[rank])
+        s_phi   = DDP(s_phi,   device_ids=[rank])
+        if is_main:
+            print(f"  DDP active across {world_size} GPUs.")
+
+    # ── Optimiser / scheduler ────────────────────────────────────────────────
     use_amp = device.type == "cuda"
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else torch.autocast("cpu")
 
@@ -228,20 +289,30 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
     )
 
     ckpt_dir = Path(cfg.train.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    ema_theta = _init_ema(s_theta)
-    ema_phi   = _init_ema(s_phi)
+    # EMA maintained only on rank 0 (params are identical across ranks via DDP)
+    ema_theta = _init_ema(s_theta) if is_main else None
+    ema_phi   = _init_ema(s_phi)   if is_main else None
 
+    # ── Training loop ────────────────────────────────────────────────────────
     step = 0
     loss_ema = None
     s_theta.train()
     s_phi.train()
     loader_iter = iter(train_loader)
-    print(f"Training on {device}, max_steps={cfg.train.max_steps}, bf16={use_amp}")
+    if is_main:
+        print(f"Training on {device} (world_size={world_size}), "
+              f"max_steps={cfg.train.max_steps}, bf16={use_amp}")
     t0 = time.time()
 
     while step < cfg.train.max_steps:
+        if ddp and train_sampler is not None:
+            # Set epoch so each DDP worker sees a different shuffle each epoch
+            epoch = step // max(1, len(train_loader))
+            train_sampler.set_epoch(epoch)
+
         try:
             batch = next(loader_iter)
         except StopIteration:
@@ -252,38 +323,48 @@ def train(cfg: cfg_module.Config, on_checkpoint: Optional[Callable[[int], None]]
         text0 = batch["text_emb"].to(device)
         lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
         r_peak_mask = batch["r_peak_mask"].to(device) if "r_peak_mask" in batch else None
+
         optimiser.zero_grad()
         with autocast:
             loss = dsm_loss(s_theta, s_phi, ecg0, text0, vpsde, cfg.train.likelihood_weighting, lead_idx,
                             cfg_drop_prob=cfg.train.cfg_drop_prob,
                             r_peak_mask=r_peak_mask, r_peak_drop_prob=cfg.train.r_peak_drop_prob)
-        # Guard against rare catastrophic batches (bfloat16 small-t instability).
-        # clamp before backward so the gradient signal is also bounded.
         loss = loss.clamp(max=50.0).nan_to_num(0.0)
         loss.backward()
         nn.utils.clip_grad_norm_(params, cfg.train.grad_clip)
         optimiser.step()
         scheduler.step()
-        _update_ema(ema_theta, s_theta)
-        _update_ema(ema_phi, s_phi)
         step += 1
 
-        raw = loss.item()
-        loss_ema = raw if loss_ema is None else 0.98 * loss_ema + 0.02 * raw
+        if is_main:
+            _update_ema(ema_theta, s_theta)
+            _update_ema(ema_phi, s_phi)
+            raw = loss.item()
+            loss_ema = raw if loss_ema is None else 0.98 * loss_ema + 0.02 * raw
 
-        if step % cfg.train.val_every == 0:
-            elapsed = time.time() - t0
-            val_loss = _validate(s_theta, s_phi, val_loader, vpsde, device, cfg)
-            print(f"step {step:6d} | val {val_loss:.4f} | ema {loss_ema:.4f} | {elapsed / 60:.1f} min")
-        if step % cfg.train.save_every == 0:
-            _save(s_theta, s_phi, optimiser, step, ckpt_dir, ema_theta=ema_theta, ema_phi=ema_phi)
-            if on_checkpoint:
-                on_checkpoint(step)
+            if step % cfg.train.val_every == 0:
+                elapsed = time.time() - t0
+                val_loss = _validate(s_theta, s_phi, val_loader, vpsde, device, cfg)
+                print(f"step {step:6d} | val {val_loss:.4f} | ema {loss_ema:.4f} | {elapsed / 60:.1f} min")
 
-    _save(s_theta, s_phi, optimiser, step, ckpt_dir, name="final", ema_theta=ema_theta, ema_phi=ema_phi)
-    if on_checkpoint:
-        on_checkpoint(step)
-    print("Training complete.")
+            if step % cfg.train.save_every == 0:
+                _save(s_theta, s_phi, optimiser, step, ckpt_dir, ema_theta=ema_theta, ema_phi=ema_phi)
+                if ddp:
+                    _try_commit_volume(step)
+                elif on_checkpoint:
+                    on_checkpoint(step)
+
+    if is_main:
+        _save(s_theta, s_phi, optimiser, step, ckpt_dir, name="final",
+              ema_theta=ema_theta, ema_phi=ema_phi)
+        if ddp:
+            _try_commit_volume(step)
+        elif on_checkpoint:
+            on_checkpoint(step)
+        print("Training complete.")
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 def _validate(s_theta, s_phi, loader, vpsde, device, cfg):
@@ -311,7 +392,8 @@ def _validate(s_theta, s_phi, loader, vpsde, device, cfg):
                 ecg_t_d = m1 + s1 * e1
                 text_t_d = m2 + s2 * e2
                 sc_ecg = s_theta(ecg_t_d, text_t_d, t_diag, lead_idx, r_peak_mask)
-                h_bot = s_theta.encode(ecg_t_d, s_theta.t_embed(t_diag), lead_idx, r_peak_mask)
+                _st = _unwrap(s_theta)
+                h_bot = _st.encode(ecg_t_d, _st.t_embed(t_diag), lead_idx, r_peak_mask)
                 sc_txt = s_phi(text_t_d, h_bot, t_diag)
                 a_t = vpsde.alpha(t_diag); sig_t = vpsde.sigma(t_diag).clamp(min=1e-8)
                 w_t = sig_t.pow(2) * (a_t / sig_t).pow(2).clamp(max=5.0)
@@ -344,8 +426,8 @@ def _save(s_theta, s_phi, optimiser, step, ckpt_dir, name=None, ema_theta=None, 
     path = ckpt_dir / f"{name or f'step_{step:07d}'}.pt"
     payload = {
         "step": step,
-        "s_theta": s_theta.state_dict(),
-        "s_phi": s_phi.state_dict(),
+        "s_theta": _unwrap(s_theta).state_dict(),
+        "s_phi": _unwrap(s_phi).state_dict(),
         "optimiser": optimiser.state_dict(),
     }
     if ema_theta is not None:
@@ -374,7 +456,7 @@ def _seed(seed: int) -> None:
     timeout=72_000,
     secrets=modal_common.HF_SECRETS,
 )
-def train_on_modal(max_steps=100_000, batch_size=256, lr=2e-4, pretrain_checkpoint="", resume_checkpoint=""):
+def train_on_modal(max_steps=100_000, batch_size=512, lr=2e-4, pretrain_checkpoint="", resume_checkpoint=""):
     """Modal entry point for distributed training.
 
     Args:
@@ -398,6 +480,8 @@ def train_on_modal(max_steps=100_000, batch_size=256, lr=2e-4, pretrain_checkpoi
     cfg.train.pretrain_checkpoint = pretrain_checkpoint
     cfg.train.resume_checkpoint = resume_checkpoint
 
+    # In DDP mode, rank-0 commits via _try_commit_volume after each save.
+    # In single-GPU mode, pass a callback so the volume is committed too.
     def commit_after_save(step):
         print(f"  committing checkpoint volume at step {step}…")
         modal_common.ckpt_vol.commit()
@@ -408,7 +492,7 @@ def train_on_modal(max_steps=100_000, batch_size=256, lr=2e-4, pretrain_checkpoi
 
 
 @modal_common.app.local_entrypoint(name="train")
-def main(max_steps: int = 100_000, batch_size: int = 256, lr: float = 2e-4, pretrain_checkpoint: str = "", resume_checkpoint: str = ""):
+def main(max_steps: int = 100_000, batch_size: int = 512, lr: float = 2e-4, pretrain_checkpoint: str = "", resume_checkpoint: str = ""):
     train_on_modal.remote(max_steps=max_steps, batch_size=batch_size, lr=lr, pretrain_checkpoint=pretrain_checkpoint, resume_checkpoint=resume_checkpoint)
 
 

@@ -49,7 +49,7 @@ The same schedule is applied independently to $\mathbf{x}$ (ECG) and $\mathbf{y}
 
 Every residual block in $s_\theta$ receives a shared conditioning vector $\mathbf{c}$ assembled by concatenation:
 
-$$\mathbf{c} = \bigl[\,\mathbf{e}_t \;\|\; \phi(\mathbf{y}_t) \;\|\; \psi(\ell) \;\|\; \rho(\mathbf{r})\,\bigr] \;\in\; \mathbb{R}^{3d + d_r}$$
+$$\mathbf{c} = \begin{bmatrix} \mathbf{e}_t \\ \phi(\mathbf{y}_t) \\ \psi(\ell) \\ \rho(\mathbf{r})\end{bmatrix} \in \mathbb{R}^{3d + d_r}$$
 
 where $d = 128$ (timestep dim) and $d_r = 64$ (R-peak encoder dim):
 
