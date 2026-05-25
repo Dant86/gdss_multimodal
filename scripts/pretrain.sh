@@ -10,8 +10,8 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=gdss_pretrain
-#SBATCH --output=logs/pretrain_%j.out
-#SBATCH --error=logs/pretrain_%j.err
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -32,11 +32,15 @@ fi
 [[ -n "${SLURM_PARTITION:-}" ]] && SBATCH_PARTITION="$SLURM_PARTITION"
 [[ -n "${SLURM_ACCOUNT:-}"   ]] && SBATCH_ACCOUNT="$SLURM_ACCOUNT"
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+LOG_DIR="${LOG_DIR:-$PROJECT_DIR/logs}"
+mkdir -p "$LOG_DIR"
+exec >"$LOG_DIR/pretrain_${SLURM_JOB_ID:-local}.out" \
+    2>"$LOG_DIR/pretrain_${SLURM_JOB_ID:-local}.err"
+
 # ── Activate virtualenv ───────────────────────────────────────────────────────
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
 source "$VENV_DIR/bin/activate"
-
-mkdir -p "$PROJECT_DIR/logs"
 
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
@@ -48,6 +52,7 @@ echo "=== pretrain  $(date) ==="
 echo "DATA_DIR        = ${DATA_DIR:-data/ptbxl}"
 echo "CACHE_DIR       = ${CACHE_DIR:-cache}"
 echo "CHECKPOINT_DIR  = ${CHECKPOINT_DIR:-checkpoints}"
+echo "LOG_DIR         = $LOG_DIR"
 
 # Extra CLI args forwarded from sbatch (e.g. --resume, --max-steps)
 EXTRA_ARGS="${@:-}"
