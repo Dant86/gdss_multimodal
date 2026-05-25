@@ -3,7 +3,8 @@ tmp/
 cache/
 checkpoints/
 samples/
-logs/
+logs/*.out
+logs/*.err
 
 # Python
 __pycache__/
