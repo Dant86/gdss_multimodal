@@ -15,8 +15,8 @@
 #SBATCH --job-name=gdss_pretrain
 #SBATCH --partition=general
 #SBATCH --qos=general
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
+#SBATCH --output=/tmp/%x_%j.out
+#SBATCH --error=/tmp/%x_%j.err
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
