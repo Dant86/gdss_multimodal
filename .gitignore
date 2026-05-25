@@ -38,3 +38,4 @@ venv/
 .modal.toml
 
 figures/
+tikz/

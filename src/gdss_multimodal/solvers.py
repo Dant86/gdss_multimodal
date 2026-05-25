@@ -22,7 +22,7 @@ import typing
 
 import torch
 
-import sde as sde_module
+import gdss_multimodal.sde as sde_module
 
 ScoreFn = typing.Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor

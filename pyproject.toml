@@ -1,44 +1,59 @@
 [project]
 name = "gdss-multimodal"
-version = "0.1.0"
+version = "0.2.0"
 description = "Joint ECG–text diffusion via generalised S4 symmetric splitting"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.1.0",   # Modal container overrides this with torch==2.4.0+cu121
-    "einops",
+    # Deep learning
+    "torch>=2.1.0",
     "transformers==4.44.2",
     "huggingface_hub>=0.22.0",
     "accelerate>=0.29.0",
+    # Data processing
     "numpy>=1.24.0",
     "scipy>=1.11.0",
     "pandas>=2.0.0",
     "wfdb>=4.1.0",
-    "modal",
+    # PTB-XL fetch pipeline
+    "anthropic>=0.25.0",
+    "langdetect>=1.0.9",
+    "kaggle>=1.6.0",
+    # Config & environment
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    # Visualisation
     "plotly>=5.0",
     "kaleido==0.2.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "plotly>=5.0", "kaleido"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
 
 # momentfm pins old transformers/huggingface_hub; install without its deps:
 #   uv pip install momentfm --no-deps
 
 [tool.pytest.ini_options]
-testpaths = ["tests.py"]
+testpaths = ["tests"]
+addopts   = "-q"
 
 [tool.ruff]
-line-length = 100
+line-length    = 100
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "W"]
 ignore = ["N999"]
 
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff.lint.isort]
-known-first-party = ["config", "data", "models", "sde", "solvers"]
+known-first-party = ["gdss_multimodal"]
 
 [tool.pyright]
-pythonVersion = "3.11"
-typeCheckingMode = "basic"
+pythonVersion       = "3.11"
+typeCheckingMode    = "basic"
 reportMissingImports = false

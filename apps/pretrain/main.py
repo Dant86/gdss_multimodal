@@ -7,34 +7,59 @@ the denoising task introduces the diffusion objective.
 
 Loss: L = MSE(recon, ecg) + λ_spec · MSE(|FFT(recon)|/L, |FFT(ecg)|/L)
 
-After training, the checkpoint can be passed to train.py via
---pretrain-checkpoint (or cfg.train.pretrain_checkpoint) so that DSM
-fine-tuning begins from morphology-aware weights.
+After training, pass the checkpoint to apps/train via --pretrain-checkpoint
+(or cfg.train.pretrain_checkpoint) so that DSM fine-tuning starts from
+morphology-aware weights.
 
-Local:  python pretrain.py
-Modal:  modal run pretrain.py
+Environment variables (loaded from .env):
+    DATA_DIR         Processed PTB-XL directory.
+    CACHE_DIR        BERT embeddings and ECG stats.
+    CHECKPOINT_DIR   Where to save checkpoints.
+    HF_TOKEN         Optional HuggingFace token.
+
+Usage
+-----
+    python apps/pretrain/main.py [--config experiments/pretrain.yaml]
+                                 [--data-dir DIR] [--cache-dir DIR]
+                                 [--checkpoint-dir DIR]
+                                 [--max-steps 30000] [--batch-size 512]
+                                 [--lr 1e-3] [--spectral-weight 0.1]
+                                 [--device cuda] [--seed 42]
+                                 [--resume CHECKPOINT_PATH]
+                                 [KEY=VALUE ...]
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import random
+import time
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Callable, Optional
 
-import config as cfg_module
-import modal_common
+import numpy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dotenv import load_dotenv
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import OneCycleLR
+from torch.utils.data import ConcatDataset, DataLoader
+
+import gdss_multimodal.config as config_module
+import gdss_multimodal.data as data_module
+import gdss_multimodal.models as models_module
 
 
 # ---------------------------------------------------------------------------
-# Spectral loss helper
+# Spectral loss
 # ---------------------------------------------------------------------------
 
-def _spectral_loss(pred: "torch.Tensor", target: "torch.Tensor") -> "torch.Tensor":
+def _spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """FFT magnitude MSE, normalised by sequence length.
 
-    Encourages the model to match the power spectral density of the target,
-    which for ECGs has a characteristic 1/f profile.
+    Encourages matching the power spectral density (1/f profile for ECGs).
 
     Args:
         pred:   Reconstructed tensor of shape (B, n_leads, L).
@@ -43,11 +68,7 @@ def _spectral_loss(pred: "torch.Tensor", target: "torch.Tensor") -> "torch.Tenso
     Returns:
         Scalar MSE over normalised FFT magnitudes.
     """
-    import torch
-    import torch.nn.functional as F
-
     L = pred.shape[-1]
-    # rfft doesn't support bfloat16 — cast to float32 for the FFT
     p = torch.fft.rfft(pred.float(), dim=-1).abs() / L
     t = torch.fft.rfft(target.float(), dim=-1).abs() / L
     return F.mse_loss(p, t)
@@ -58,33 +79,21 @@ def _spectral_loss(pred: "torch.Tensor", target: "torch.Tensor") -> "torch.Tenso
 # ---------------------------------------------------------------------------
 
 def pretrain(
-    cfg: cfg_module.Config,
+    cfg: config_module.Config,
     on_checkpoint: Optional[Callable[[int], None]] = None,
 ) -> str:
-    """Run the autoencoder pre-training loop.
+    """Run the ECGUNet autoencoder pre-training loop.
 
     Uses all PTB-XL splits (train + val + test) since we are learning ECG
-    morphology, not fitting the joint distribution.
+    morphology rather than fitting the joint distribution.
 
     Args:
         cfg: Experiment configuration (reads cfg.pretrain and cfg.ecg_score).
         on_checkpoint: Optional callback invoked after each checkpoint save.
 
     Returns:
-        Path to the final pretrain checkpoint.
+        Path to the final pretrain checkpoint as a string.
     """
-    import time
-
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torch.optim import AdamW
-    from torch.optim.lr_scheduler import OneCycleLR
-    from torch.utils.data import ConcatDataset, DataLoader
-
-    import data as data_module
-    import models as models_module
-
     pcfg = cfg.pretrain
     ecfg = cfg.ecg_score
     device = torch.device(cfg.train.device if torch.cuda.is_available() else "cpu")
@@ -93,8 +102,10 @@ def pretrain(
     multi_lead = ecfg.lead_emb_dim > 0
     print(f"Loading datasets… (multi_lead={multi_lead})")
     train_ds, val_ds, test_ds = data_module.build_datasets(
-        cfg.train.data_dir, cfg.train.data_cache_dir,
-        bert_device=cfg.train.device, multi_lead=multi_lead,
+        cfg.train.data_dir,
+        cfg.train.data_cache_dir,
+        bert_device=str(device),
+        multi_lead=multi_lead,
     )
     # Use all splits — pretraining only learns ECG morphology
     all_ds = ConcatDataset([train_ds, val_ds, test_ds])
@@ -116,7 +127,6 @@ def pretrain(
         channels=ecfg.channels,
         bottleneck_ch=ecfg.bottleneck_ch,
         lead_emb_dim=ecfg.lead_emb_dim,
-        r_peak_enc_dim=ecfg.r_peak_enc_dim,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  ECGUNet params: {n_params / 1e6:.2f}M")
@@ -124,7 +134,7 @@ def pretrain(
     if pcfg.resume:
         resume_path = Path(pcfg.resume)
         print(f"  Resuming from {resume_path}…")
-        state = torch.load(resume_path, map_location=device)
+        state = torch.load(resume_path, map_location=device, weights_only=True)
         model.load_state_dict(state["s_theta"])
 
     use_amp = device.type == "cuda"
@@ -156,13 +166,14 @@ def pretrain(
             loader_iter = iter(loader)
             batch = next(loader_iter)
 
-        ecg = batch["ecg"].to(device)          # (B, 1, seq_len)
-        lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
-        r_peak_mask = batch["r_peak_mask"].to(device) if "r_peak_mask" in batch else None
+        ecg = batch["ecg"].to(device)
+        lead_idx = batch.get("lead_idx")
+        if lead_idx is not None:
+            lead_idx = lead_idx.to(device)
 
         optimiser.zero_grad()
         with autocast:
-            recon = model.reconstruct(ecg, lead_idx, r_peak_mask)
+            recon = model.reconstruct(ecg, lead_idx)
             mse = F.mse_loss(recon, ecg)
             spec = _spectral_loss(recon, ecg)
             loss = mse + pcfg.spectral_weight * spec
@@ -185,7 +196,7 @@ def pretrain(
             )
 
         if step % pcfg.save_every == 0 or step == pcfg.max_steps:
-            ckpt_path = _save_pretrain(model, optimiser, step, ckpt_dir)
+            _save_pretrain(model, optimiser, step, ckpt_dir)
             if on_checkpoint:
                 on_checkpoint(step)
 
@@ -199,8 +210,7 @@ def pretrain(
 # ---------------------------------------------------------------------------
 
 def _save_pretrain(model, optimiser, step, ckpt_dir, name=None):
-    import torch
-
+    """Save a pretrain checkpoint and return its path."""
     fname = name or f"pretrain_step_{step:07d}"
     path = Path(ckpt_dir) / f"{fname}.pt"
     torch.save(
@@ -216,9 +226,7 @@ def _save_pretrain(model, optimiser, step, ckpt_dir, name=None):
 
 
 def _seed(seed: int) -> None:
-    import numpy
-    import torch
-
+    """Seed all relevant RNGs for reproducibility."""
     random.seed(seed)
     numpy.random.seed(seed)
     torch.manual_seed(seed)
@@ -227,96 +235,51 @@ def _seed(seed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Modal
+# CLI
 # ---------------------------------------------------------------------------
 
-@modal_common.app.function(
-    image=modal_common.image,
-    gpu=modal_common.GPU,
-    volumes=modal_common.VOLUME_MAP,
-    timeout=14_400,   # 4 hours — 30K steps ≈ 20 min on H100
-    secrets=modal_common.HF_SECRETS,
-)
-def pretrain_on_modal(
-    max_steps: int = 30_000,
-    batch_size: int = 512,
-    lr: float = 1e-3,
-    spectral_weight: float = 0.1,
-    resume: str = "",
-):
-    """Modal entry point for ECGUNet autoencoder pre-training.
-
-    Args:
-        max_steps: Total pre-training steps (30K ≈ 20 min on H100).
-        batch_size: Per-GPU batch size.
-        lr: Peak learning rate for the OneCycleLR schedule.
-        spectral_weight: Weight of the FFT magnitude loss.
-        resume: Path to an existing pretrain checkpoint to resume from.
-    """
-    import os
-
-    os.environ["HF_HOME"] = modal_common.HF_CACHE_DIR
-
-    cfg = cfg_module.Config()
-    cfg.train.device = "cuda"
-    cfg.train.data_dir = f"{modal_common.REMOTE_CACHE}/ptbxl"
-    cfg.train.data_cache_dir = modal_common.REMOTE_CACHE
-    cfg.pretrain.max_steps = max_steps
-    cfg.pretrain.batch_size = batch_size
-    cfg.pretrain.lr = lr
-    cfg.pretrain.spectral_weight = spectral_weight
-    cfg.pretrain.checkpoint_dir = modal_common.REMOTE_CKPTS
-    cfg.pretrain.resume = resume
-
-    def commit_after_save(step):
-        print(f"  committing checkpoint volume at step {step}…")
-        modal_common.ckpt_vol.commit()
-
-    pretrain(cfg, on_checkpoint=commit_after_save)
-    modal_common.ckpt_vol.commit()
-    modal_common.cache_vol.commit()
-
-
-@modal_common.app.local_entrypoint(name="pretrain")
-def main(
-    max_steps: int = 30_000,
-    batch_size: int = 512,
-    lr: float = 1e-3,
-    spectral_weight: float = 0.1,
-    resume: str = "",
-):
-    pretrain_on_modal.remote(
-        max_steps=max_steps,
-        batch_size=batch_size,
-        lr=lr,
-        spectral_weight=spectral_weight,
-        resume=resume,
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="ECGUNet autoencoder pre-training.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--config", default="", help="Path to YAML config file.")
+    parser.add_argument("--data-dir",        default=os.environ.get("DATA_DIR", "data/ptbxl"))
+    parser.add_argument("--cache-dir",       default=os.environ.get("CACHE_DIR", "cache"))
+    parser.add_argument("--checkpoint-dir",  default=os.environ.get("CHECKPOINT_DIR", "checkpoints"))
+    parser.add_argument("--max-steps",       type=int,   default=None)
+    parser.add_argument("--batch-size",      type=int,   default=None)
+    parser.add_argument("--lr",              type=float, default=None)
+    parser.add_argument("--spectral-weight", type=float, default=None)
+    parser.add_argument("--device",          default=None)
+    parser.add_argument("--seed",            type=int,   default=None)
+    parser.add_argument("--resume",          default=None, help="Path to pretrain checkpoint to resume.")
+    # Allow dot-notation overrides: e.g.  ecg_score.channels=64,128,256
+    parser.add_argument("overrides", nargs="*", metavar="KEY=VALUE")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ECGUNet autoencoder pre-training")
-    parser.add_argument("--max-steps", type=int, default=30_000)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--spectral-weight", type=float, default=0.1)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--data-dir", default="data/ptbxl")
-    parser.add_argument("--cache-dir", default="cache")
-    parser.add_argument("--checkpoint-dir", default="checkpoints")
-    parser.add_argument("--resume", default="")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+    load_dotenv()
 
-    cfg = cfg_module.Config()
-    cfg.train.device = args.device
-    cfg.train.data_dir = args.data_dir
+    args = _parse_args()
+
+    cfg = config_module.Config.from_yaml(args.config) if args.config else config_module.Config()
+
+    # Path / device overrides from CLI flags
+    cfg.train.data_dir       = args.data_dir
     cfg.train.data_cache_dir = args.cache_dir
-    cfg.train.seed = args.seed
-    cfg.pretrain.max_steps = args.max_steps
-    cfg.pretrain.batch_size = args.batch_size
-    cfg.pretrain.lr = args.lr
-    cfg.pretrain.spectral_weight = args.spectral_weight
     cfg.pretrain.checkpoint_dir = args.checkpoint_dir
-    cfg.pretrain.resume = args.resume
+    if args.max_steps       is not None: cfg.pretrain.max_steps       = args.max_steps
+    if args.batch_size      is not None: cfg.pretrain.batch_size      = args.batch_size
+    if args.lr              is not None: cfg.pretrain.lr              = args.lr
+    if args.spectral_weight is not None: cfg.pretrain.spectral_weight = args.spectral_weight
+    if args.device          is not None: cfg.train.device             = args.device
+    if args.seed            is not None: cfg.train.seed               = args.seed
+    if args.resume          is not None: cfg.pretrain.resume          = args.resume
+
+    # Dot-notation key=value overrides (e.g. ecg_score.channels=64,128,256)
+    if args.overrides:
+        cfg.override({k: v for k, v in (o.split("=", 1) for o in args.overrides)})
+
     pretrain(cfg)

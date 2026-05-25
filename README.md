@@ -10,7 +10,7 @@ Score-based generative model over paired (ECG waveform, clinical report embeddin
 
 The model jointly fits a **conditional generative distribution** over ECG waveforms and clinical text embeddings:
 
-$$p_\theta\!\left(\mathbf{x},\, \mathbf{y} \;\middle|\; \ell,\, \mathbf{r}\right)$$
+$$p_\theta\!\left(\mathbf{x},\, \mathbf{y} \;\middle|\; \ell\right)$$
 
 where:
 
@@ -19,9 +19,8 @@ where:
 | $\mathbf{x} \in \mathbb{R}^{L}$ | ECG waveform for a single lead ($L = 1000$ samples at 100 Hz) |
 | $\mathbf{y} \in \mathbb{R}^{768}$ | BioClinicalBERT [CLS] token embedding of the paired clinical report |
 | $\ell \in \{0,\ldots,11\}$ | Lead identity (which of the 12 ECG leads is being modelled) |
-| $\mathbf{r} \in \{0,1\}^{L}$ | Binary R-peak mask — 1 at QRS spike positions, 0 elsewhere |
 
-Training uses all 12 leads of each PTB-XL recording, expanding the effective dataset from 17 K to **209 K samples**. The model learns a shared score function across all leads, distinguished by the lead embedding $\ell$, and anchors QRS spike positions via the R-peak mask $\mathbf{r}$.
+Training uses all 12 leads of each PTB-XL recording, expanding the effective dataset from ~17 K recordings to **~209 K samples**. The model learns a shared score function across all leads, distinguished by the lead embedding $\ell$.
 
 ---
 
@@ -49,16 +48,15 @@ The same schedule is applied independently to $\mathbf{x}$ (ECG) and $\mathbf{y}
 
 Every residual block in $s_\theta$ receives a shared conditioning vector $\mathbf{c}$ assembled by concatenation:
 
-$$\mathbf{c} = \begin{bmatrix} \mathbf{e}_t \\ \phi(\mathbf{y}_t) \\ \psi(\ell) \\ \rho(\mathbf{r})\end{bmatrix} \in \mathbb{R}^{3d + d_r}$$
+$$\mathbf{c} = \begin{bmatrix} \mathbf{e}_t \\ \phi(\mathbf{y}_t) \\ \psi(\ell) \end{bmatrix} \in \mathbb{R}^{3d}$$
 
-where $d = 128$ (timestep dim) and $d_r = 64$ (R-peak encoder dim):
+where $d = 128$ (timestep dim):
 
 | Component | Description |
 |-----------|-------------|
 | $\mathbf{e}_t = \mathrm{SinEmbed}(t) \in \mathbb{R}^d$ | Sinusoidal timestep embedding (Ho et al., 2020) |
 | $\phi(\mathbf{y}_t) = \mathrm{SiLU}(W_\phi\,\mathbf{y}_t) \in \mathbb{R}^d$ | Linear projection of noisy text embedding |
 | $\psi(\ell) = \mathrm{SiLU}(W_\psi\,\mathrm{Embed}(\ell)) \in \mathbb{R}^d$ | Lead identity embedding (nn.Embedding(12, 64) → Linear → SiLU) |
-| $\rho(\mathbf{r}) = \mathrm{RPeakEncoder}(\mathbf{r}) \in \mathbb{R}^{d_r}$ | R-peak CNN encoder (see below) |
 
 This vector is consumed by **FiLM** (Feature-wise Linear Modulation) at every residual block:
 
@@ -66,33 +64,11 @@ $$\mathrm{FiLM}(\mathbf{h},\, \mathbf{c}) = \gamma(\mathbf{c}) \odot \mathbf{h} 
 
 where $\gamma, \beta$ are produced by a 2-layer MLP with zero-initialised output, so all blocks start as identity maps at initialisation.
 
-**Classifier-free guidance (CFG)** is implemented by independently dropping $\ell$ (with probability $p_\ell = 0.10$) and $\mathbf{r}$ (with probability $p_r = 0.10$) during training, replacing them with zero vectors so the model simultaneously learns the conditional and unconditional scores. At inference, CFG is applied to the lead dimension:
+**Classifier-free guidance (CFG)** drops the lead identity $\ell$ during training (probability $p_\ell = 0.10$), replacing it with a null sentinel so the model simultaneously learns the conditional and unconditional scores. At inference:
 
-$$\tilde{s}_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell, \mathbf{r}) = (1 + w)\,s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell, \mathbf{r}) - w\,s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \varnothing, \mathbf{r})$$
+$$\tilde{s}_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) = (1 + w)\,s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) - w\,s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \varnothing)$$
 
 with guidance scale $w = 1.5$.
-
----
-
-### R-peak encoder $\rho$
-
-The R-peak mask $\mathbf{r} \in \{0,1\}^L$ (detected on Lead II via XQRS, shared across all leads) is encoded by a lightweight 1D CNN:
-
-$$\rho(\mathbf{r}) = \mathrm{AvgPool}(\mathrm{Conv}_3 \to \mathrm{Conv}_2 \to \mathrm{Conv}_1)(\mathbf{r})$$
-
-| Layer | Config | Output shape |
-|-------|--------|-------------|
-| Conv1d | 1→32, k=9, stride=1 | $(B,\,32,\,L)$ |
-| Conv1d | 32→64, k=7, stride=4 | $(B,\,64,\,L/4)$ |
-| Conv1d | 64→64, k=7, stride=4 | $(B,\,64,\,L/16)$ |
-| AdaptiveAvgPool1d(1) | — | $(B,\,64,\,1)$ |
-| Flatten | — | $(B,\,64)$ |
-
-The encoder compresses sparse beat positions into a dense vector that captures heart rate, rhythm regularity, and beat phase — giving the score network a stable anchor for QRS spike generation.
-
-At inference, R-peak masks are synthesised at a specified heart rate $f_\mathrm{HR}$ with small jitter $\epsilon \sim \mathrm{Uniform}(-\delta, \delta)$ where $\delta = 0.05 \times T_\mathrm{RR}$:
-
-$$T_\mathrm{RR} = \frac{f_s \cdot 60}{f_\mathrm{HR}}, \qquad r_k = \left\lfloor T_\mathrm{phase} + k\,(T_\mathrm{RR} + \epsilon_k) \right\rceil$$
 
 ---
 
@@ -102,23 +78,23 @@ $$T_\mathrm{RR} = \frac{f_s \cdot 60}{f_\mathrm{HR}}, \qquad r_k = \left\lfloor 
 
 | Component | Config |
 |-----------|--------|
-| Input conv | 1→64, k=3 |
-| Encoder levels | 64→128→256, stride-2 each |
-| Stride-4 attention | 8 heads, seq_len/4 positions (~2 cardiac cycles) |
-| Bottleneck | 512 channels, self-attention (8 heads) |
+| Input conv | 1→128, k=3 |
+| Encoder levels | 128→256→512, stride-2 each |
+| Bottleneck | 1024 channels, self-attention |
 | Decoder levels | skip-connected, stride-2 transpose conv |
-| Output conv | 64→1, k=1 |
-| Parameters | ~9.3 M |
+| Output conv | 128→1, k=1 |
 
 **Pretraining** (30 K steps, lr=1e-3, OneCycleLR): ECGUNet is first trained as a pure autoencoder with reconstruction loss $\mathcal{L}_\mathrm{pre} = \mathcal{L}_\mathrm{MSE} + \lambda_\mathrm{spec}\,\mathcal{L}_\mathrm{FFT}$, where $\mathcal{L}_\mathrm{FFT}$ is MSE over normalised FFT magnitudes. This builds in ECG morphology — QRS complexes, 1/f PSD, baseline wander — before any diffusion training.
+
+The bottleneck also serves as an ECG context extractor: `encode()` returns an L2-normalised mean-pooled vector passed to $s_\phi$.
 
 ---
 
 ### Text score network $s_\phi$
 
-4-layer residual MLP. The ECG context is extracted by mean-pooling the ECGUNet bottleneck:
+6-layer residual MLP. The ECG context is extracted by mean-pooling the ECGUNet bottleneck:
 
-$$\mathbf{h}_\theta(\mathbf{x}_t, t, \ell, \mathbf{r}) = \mathrm{MeanPool}\!\left(\mathrm{Bottleneck}_{s_\theta}(\mathbf{x}_t, t, \ell, \mathbf{r})\right) \in \mathbb{R}^{512}$$
+$$\mathbf{h}_\theta(\mathbf{x}_t, t, \ell) = \mathrm{L2Norm}\!\left(\mathrm{MeanPool}\!\left(\mathrm{Bottleneck}_{s_\theta}(\mathbf{x}_t, t, \ell)\right)\right) \in \mathbb{R}^{1024}$$
 
 The text score is then:
 
@@ -132,7 +108,7 @@ FiLM conditioning with $(t,\, \mathbf{h}_\theta)$ applied at every residual laye
 
 Joint **denoising score matching (DSM)** with min-SNR-5 likelihood weighting $w(t)$:
 
-$$\mathcal{L} = \mathbb{E}_{t,\,\mathbf{x}_0,\,\mathbf{y}_0,\,\boldsymbol{\epsilon}}\!\left[w(t)\left(\left\|s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell, \mathbf{r}) + \frac{\boldsymbol{\epsilon}_1}{\sigma(t)}\right\|^2 + \left\|s_\phi(\mathbf{y}_t, \mathbf{h}_\theta, t) + \frac{\boldsymbol{\epsilon}_2}{\sigma(t)}\right\|^2\right)\right]$$
+$$\mathcal{L} = \mathbb{E}_{t,\,\mathbf{x}_0,\,\mathbf{y}_0,\,\boldsymbol{\epsilon}}\!\left[w(t)\left(\left\|s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) + \frac{\boldsymbol{\epsilon}_1}{\sigma(t)}\right\|^2 + \left\|s_\phi(\mathbf{y}_t, \mathbf{h}_\theta, t) + \frac{\boldsymbol{\epsilon}_2}{\sigma(t)}\right\|^2\right)\right]$$
 
 The min-SNR-5 weight (Hang et al., 2023) balances the loss across diffusion times:
 
@@ -167,13 +143,11 @@ The symmetric arrangement reduces the local operator splitting error from $\math
 > Wagner, P., Strodthoff, N., Bousseljot, R., Kreiseler, D., Lunze, F. I., Samek, W., & Schaeffter, T. (2020). *PTB-XL, a large publicly available electrocardiography dataset.* Scientific Data, 7(1), 154. [PhysioNet](https://physionet.org/content/ptb-xl/1.0.3/)
 
 - **21,837 records**, 10 seconds each, 12 leads at 100 Hz (1000 samples/lead)
-- Free text clinical reports in German (auto-translated to English in the CSV)
+- Clinical reports originally in German; translated to English via Anthropic Batch API (stored as `report_en` column)
 - Stratified 10-fold cross-validation splits: folds 1–8 train, fold 9 val, fold 10 test
 - Multi-lead training expands each recording to 12 samples → **~209 K train samples**
 
-**Text embeddings**: [Bio_ClinicalBERT](https://huggingface.co/emilyalsentzer/Bio_ClinicalBERT) [CLS] token, 768-dim, cached on first run.
-
-**R-peak masks**: Computed once via XQRS (wfdb) on Lead II of each recording, cached to `rpeak_masks.pkl`. Detection failures fall back to an all-zeros mask (unconditional).
+**Text embeddings**: [Bio_ClinicalBERT](https://huggingface.co/emilyalsentzer/Bio_ClinicalBERT) [CLS] token, 768-dim, cached to disk on first run.
 
 ---
 
@@ -185,88 +159,145 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Create environment and install deps
 uv venv && source .venv/bin/activate
-uv pip install -e .
+uv pip install -e ".[dev]"
+
+# momentfm pins old transformers/huggingface_hub; install without its deps
+uv pip install momentfm --no-deps
+```
+
+Copy `.env.example` → `.env` and fill in your cluster settings (used by SLURM scripts):
+
+```bash
+cp .env.example .env
 ```
 
 ---
 
 ## Data preparation
 
-PTB-XL requires a free PhysioNet account. The fastest source is the [Kaggle mirror](https://www.kaggle.com/datasets/khyeh0719/ptb-xl-dataset).
+PTB-XL is available via [Kaggle](https://www.kaggle.com/datasets/khyeh0719/ptb-xl-dataset). The `fetch_data` app downloads it, translates German reports, and caches BioClinicalBERT embeddings:
 
 ```bash
-# Upload the zip to the Modal cache volume (single file = fast)
-modal volume put gdss-cache ~/Downloads/ptbxl.zip ptbxl.zip
+# Requires KAGGLE_USERNAME / KAGGLE_KEY in .env
+python apps/fetch_data/main.py \
+    --data-dir data/ptbxl \
+    --cache-dir data/cache \
+    --anthropic-model claude-haiku-3-5-20241022
 
-# Unzip inside the container
-modal run download_ptbxl.py
+# Or via SLURM (2 h, CPU-only job)
+sbatch scripts/fetch_data.sh
 ```
+
+The pipeline:
+1. Download PTB-XL zip from Kaggle → extract to `--data-dir`
+2. Detect language of each report with `langdetect`
+3. Translate German reports to English via Anthropic Batch API → `report_en` column
+4. Compute per-lead signal statistics
+5. Cache BioClinicalBERT embeddings to `--cache-dir`
 
 ---
 
 ## Training
 
 ```bash
-# Step 1: pretrain ECGUNet as autoencoder (30K steps, ~20 min on H100)
-modal run pretrain.py
+# Step 1: pretrain ECGUNet as autoencoder (30 K steps)
+sbatch scripts/pretrain.sh
+# or locally:
+python apps/pretrain/main.py \
+    --config configs/default.yaml \
+    --data-dir data/ptbxl \
+    --cache-dir data/cache \
+    --checkpoint-dir checkpoints/pretrain
 
-# Step 2: DSM fine-tune from pretrained weights (100K steps, ~80 min on H100)
-modal run train.py --pretrain-checkpoint /vol/checkpoints/pretrain_final.pt --max-steps 100000
-
-# Or run the full pipeline unattended
-bash pipeline_v3.sh
+# Step 2: DSM fine-tune from pretrained weights (100 K steps)
+sbatch scripts/train.sh
+# or locally:
+python apps/train/main.py \
+    --config configs/default.yaml \
+    --data-dir data/ptbxl \
+    --cache-dir data/cache \
+    --checkpoint-dir checkpoints/train \
+    --pretrain-checkpoint checkpoints/pretrain/final.pt
 ```
 
-Checkpoints saved every 5 K steps to the `gdss-checkpoints` Modal volume.
+Config values can be overridden on the command line:
+
+```bash
+python apps/train/main.py --config configs/default.yaml \
+    train.lr=3e-4 train.max_steps=200000
+```
+
+Checkpoints are saved every 5 K steps. Pass `--resume` to continue from the latest checkpoint.
 
 ---
 
 ## Sampling
 
 ```bash
-# Modal — conditional on Lead II at 72 bpm, CFG scale 1.5
-modal run sample.py \
-    --checkpoint final \
+sbatch scripts/sample.sh
+# or locally:
+python apps/visualize/main.py \
+    --config configs/default.yaml \
+    --checkpoint checkpoints/train/final.pt \
     --sampler s4 \
     --n-steps 1000 \
     --n-samples 1000 \
     --cfg-scale 1.5 \
-    --heart-rate-bpm 72.0
+    --lead-idx 1 \
+    --output-dir outputs/samples
 ```
 
-The `--heart-rate-bpm` argument controls the synthetic R-peak mask used at inference. Try 50 (bradycardia), 72 (normal sinus rhythm), 100 (tachycardia).
-
-Sampler options: `s4` (default), `pc`, `em`.
+Sampler options: `s4` (default, $\mathcal{O}(\delta t^3)$ splitting error), `pc` (predictor-corrector), `em` (Euler-Maruyama).
 
 ---
 
 ## Evaluation
 
 ```bash
-modal run evaluate.py -- --checkpoint final --nfe 100,500,1000 --samplers s4,pc,em
+sbatch scripts/eval.sh
+# or locally:
+python apps/eval/main.py \
+    --config configs/default.yaml \
+    --checkpoint checkpoints/train/final.pt \
+    --data-dir data/ptbxl \
+    --cache-dir data/cache \
+    --output-dir outputs/eval \
+    --n-samples 1000
 ```
 
-Metrics:
+Metrics reported:
 - **ECG FID** — Fréchet distance in MOMENT-1-large feature space
-- **Text cosine similarity** — mean max nearest-neighbour cosine sim
-- **Joint quality** — label agreement between generated ECGs and nearest-text labels
+- **Text cosine similarity** — mean max nearest-neighbour cosine sim between generated and real text embeddings
+- **Joint quality** — label agreement between generated ECGs and their nearest text neighbours
 
 ---
 
 ## Project layout
 
 ```
-config.py           Dataclass hyperparameter configuration
-data.py             PTB-XL loading, BioClinicalBERT + R-peak caches, datasets
-models.py           FiLM, SinEmbed, _RPeakEncoder, ECGUNet (s_θ), TextScoreNet (s_φ)
-sde.py              VP-SDE schedule and marginal probability helpers
-solvers.py          S4, PC, and EM samplers
-pretrain.py         ECGUNet autoencoder pretraining (local + Modal)
-train.py            DSM training loop (local + Modal)
-sample.py           Reverse diffusion generation + make_rpeak_mask (local + Modal)
-evaluate.py         FID / cosine-sim / joint-quality metrics (local + Modal)
-visualize.py        Publication figures: waveform grid, PSD, text neighbours
-pipeline_v3.sh      Unattended: pretrain → DSM train → sample → visualize
-download_ptbxl.py   Unzip PTB-XL inside a Modal container
-modal_common.py     Shared Modal image, volumes, and GPU config
+src/gdss_multimodal/
+    __init__.py         Package marker
+    config.py           Dataclass hyperparameter configuration (YAML ↔ dataclass)
+    sde.py              VP-SDE schedule and marginal probability helpers
+    models.py           FiLM, SinEmbed, ECGUNet (s_θ), TextScoreNet (s_φ)
+    solvers.py          S4, PC, and EM samplers + SAMPLERS dispatch dict
+    data.py             PTB-XL loading, BioClinicalBERT cache, PyTorch datasets
+    sample.py           load_models() and generate() entry points
+
+apps/
+    fetch_data/main.py  Kaggle download → langdetect → Anthropic Batch API → BERT cache
+    pretrain/main.py    ECGUNet autoencoder pretraining (MSE + spectral loss)
+    train/main.py       Joint DSM training loop with EMA, CFG, min-SNR-5 weighting
+    eval/main.py        FID / cosine-sim / joint-quality metrics + bar chart
+    visualize/main.py   Publication figures: waveform grid, PSD, text neighbours
+
+scripts/
+    fetch_data.sh       SLURM: 2 h, CPU — data download and preprocessing
+    pretrain.sh         SLURM: 12 h, 1 GPU — ECGUNet autoencoder pretraining
+    train.sh            SLURM: 12 h, 1 GPU — joint DSM training
+    eval.sh             SLURM: 12 h, 1 GPU — evaluation metrics
+    visualize.sh        SLURM: 2 h, 1 GPU — figure generation
+
+tests/                  pytest suite (139 tests, 100% src/ coverage)
+configs/                YAML configuration files
 ```

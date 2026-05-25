@@ -1,42 +1,43 @@
 """PTB-XL dataset loading, normalisation, and BioClinicalBERT embedding cache.
 
-PTB-XL is sourced from PhysioNet and stored in WFDB format:
+PTB-XL directory layout (after fetch_data app runs):
 
-    data_dir/
-        ptbxl_database.csv          metadata: ecg_id, report, strat_fold, …
-        records100/                 100 Hz WFDB recordings (12 leads × 1000 samples)
+    DATA_DIR/
+        ptbxl_database.csv      metadata with report_en column (English translations)
+        records100/             100 Hz WFDB recordings (12 leads × 1000 samples)
             00000/
                 00001_lr.dat
                 00001_lr.hea
-
-Download instructions:
-    1. Create a free PhysioNet account at https://physionet.org
-    2. Download PTB-XL 1.0.3 (fastest via Kaggle mirror)
-    3. modal volume put gdss-cache ~/Downloads/ptbxl.zip ptbxl.zip
-    4. modal run download_ptbxl.py
 
 Fold convention (PTB-XL stratified splits):
     folds 1–8  → train
     fold 9     → validation
     fold 10    → test
+
+Records with empty report_en are excluded from training.
 """
 
 from __future__ import annotations
 
+import ast
+import collections
 import pickle
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
-import time
 
 import numpy
+import pandas
 import torch
+import transformers
+import wfdb
 from torch.utils.data import Dataset
 
 
 N_LEADS = 12
 SEQ_LEN = 1000
-LEAD_IDX = 1           # default single-lead index (Lead II) used in single-lead mode
+LEAD_IDX = 1           # Lead II — default for single-lead visualisation
 BERT_MODEL = "emilyalsentzer/Bio_ClinicalBERT"
 PTBXL_CSV = "ptbxl_database.csv"
 RECORDS_DIR = "records100"
@@ -71,22 +72,27 @@ def split_by_fold(
 def load_ptbxl_records(data_dir: str | Path) -> list[dict[str, Any]]:
     """Read ptbxl_database.csv and return a list of record dicts.
 
+    Uses the ``report_en`` column (English translations written by fetch_data).
+    Records with an empty report are excluded.
+
     Each dict contains:
         ecg_id (int), filename_lr (str), report (str),
         strat_fold (int), label (int, −1 if unavailable).
 
     Args:
-        data_dir: Root directory of the PTB-XL download.
+        data_dir: Root directory of the processed PTB-XL data.
 
     Returns:
-        List of record dicts.
+        List of record dicts (only records with a non-empty report).
     """
-    import ast
-    import collections
-    import pandas
-
     data_dir = Path(data_dir)
     df = pandas.read_csv(data_dir / PTBXL_CSV, index_col="ecg_id")
+
+    # Determine the report column: prefer translated English, fall back to raw.
+    if "report_en" in df.columns:
+        report_col = "report_en"
+    else:
+        report_col = "report"
 
     try:
         parsed = df["scp_codes"].apply(ast.literal_eval)
@@ -103,29 +109,28 @@ def load_ptbxl_records(data_dir: str | Path) -> list[dict[str, Any]]:
         df["label"] = -1
 
     records = []
+    skipped = 0
     for ecg_id, row in df.iterrows():
+        report = str(row.get(report_col, "")).strip()
+        if not report or report.lower() in ("nan", "none", ""):
+            skipped += 1
+            continue
         records.append({
             "ecg_id": int(ecg_id),
             "filename_lr": str(row["filename_lr"]),
-            "report": str(row.get("report", "")),
+            "report": report,
             "strat_fold": int(row["strat_fold"]),
             "label": int(row["label"]),
             "_data_dir": str(data_dir),
         })
+
+    if skipped:
+        print(f"  skipped {skipped} records with empty reports.")
     return records
 
 
 def _load_waveform(rec: dict[str, Any]) -> numpy.ndarray:
-    """Read one WFDB recording and return float32 array of shape (12, SEQ_LEN).
-
-    Args:
-        rec: Record dict from load_ptbxl_records.
-
-    Returns:
-        ECG array of shape (N_LEADS, SEQ_LEN), padded or truncated as needed.
-    """
-    import wfdb
-
+    """Read one WFDB recording and return float32 array of shape (12, SEQ_LEN)."""
     path = Path(rec["_data_dir"]) / rec["filename_lr"]
     signal, _ = wfdb.rdsamp(str(path))
     arr = signal.T.astype(numpy.float32)
@@ -196,8 +201,6 @@ def build_embedding_cache(
     Returns:
         Dict mapping ecg_id strings to CLS-token embeddings.
     """
-    import transformers
-
     cache_path = Path(cache_path)
     if cache_path.exists():
         with open(cache_path, "rb") as f:
@@ -207,7 +210,7 @@ def build_embedding_cache(
     tokenizer = transformers.AutoTokenizer.from_pretrained(BERT_MODEL)
     model = transformers.AutoModel.from_pretrained(BERT_MODEL).eval().to(device)
 
-    texts = [rec.get("report", "") or "" for rec in records]
+    texts = [rec["report"] for rec in records]
     ids = [str(rec["ecg_id"]) for rec in records]
     cache: dict[str, numpy.ndarray] = {}
 
@@ -234,74 +237,6 @@ def build_embedding_cache(
     return cache
 
 
-def _detect_rpeak_mask(waveform_12lead: numpy.ndarray, fs: int = 100, det_lead: int = 1) -> numpy.ndarray:
-    """Detect R-peaks in a 12-lead waveform and return a binary mask.
-
-    Uses Lead II (index 1) for detection — it has the clearest QRS complex.
-    The resulting mask is shared across all leads since R-peaks are a property
-    of the cardiac cycle, not of the recording angle.
-
-    Args:
-        waveform_12lead: Array of shape (N_LEADS, SEQ_LEN).
-        fs: Sampling frequency in Hz.
-        det_lead: Lead index to run XQRS on (default 1 = Lead II).
-
-    Returns:
-        Float32 binary mask of shape (SEQ_LEN,) with 1.0 at R-peak positions.
-    """
-    try:
-        import wfdb.processing
-        sig = waveform_12lead[det_lead].astype(float)
-        qrs_inds = wfdb.processing.xqrs_detect(sig=sig, fs=fs, verbose=False)
-        mask = numpy.zeros(waveform_12lead.shape[1], dtype=numpy.float32)
-        valid = qrs_inds[qrs_inds < mask.shape[0]]
-        mask[valid] = 1.0
-        return mask
-    except Exception:
-        return numpy.zeros(waveform_12lead.shape[1], dtype=numpy.float32)
-
-
-def build_rpeak_cache(
-    records: list[dict[str, Any]],
-    cache_path: str | Path,
-    fs: int = 100,
-) -> dict[str, numpy.ndarray]:
-    """Compute or load R-peak binary masks for all records.
-
-    Maps str(ecg_id) → float32 array of shape (SEQ_LEN,).
-    Loads from disk if the cache file already exists.
-
-    Args:
-        records: All record dicts (any split).
-        cache_path: Path to store/load the pickle cache.
-        fs: ECG sampling frequency in Hz.
-
-    Returns:
-        Dict mapping ecg_id strings to binary R-peak masks.
-    """
-    cache_path = Path(cache_path)
-    if cache_path.exists():
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
-    print(f"Computing R-peak masks for {len(records)} recordings → {cache_path}")
-    t0 = time.time()
-    rpeak_cache: dict[str, numpy.ndarray] = {}
-    for i, rec in enumerate(records):
-        waveform = _load_waveform(rec)
-        mask = _detect_rpeak_mask(waveform, fs=fs)
-        rpeak_cache[str(rec["ecg_id"])] = mask
-        if (i + 1) % 2000 == 0 or (i + 1) == len(records):
-            rate = (i + 1) / (time.time() - t0)
-            print(f"  rpeak {i + 1}/{len(records)} | {rate:.0f} rec/s")
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cache_path, "wb") as f:
-        pickle.dump(rpeak_cache, f)
-    print("  R-peak cache saved.")
-    return rpeak_cache
-
-
 def _preload_waveforms(records: list[dict[str, Any]]) -> dict[int, numpy.ndarray]:
     """Parallel-load all waveforms, returning {index: ndarray}."""
     n = len(records)
@@ -321,17 +256,16 @@ def _preload_waveforms(records: list[dict[str, Any]]) -> dict[int, numpy.ndarray
 
 
 class PTBXLDataset(Dataset):
-    """PTB-XL (ECG, text embedding) dataset, fully pre-loaded into RAM.
+    """PTB-XL (ECG, text embedding) dataset — single-lead, fully pre-loaded.
 
-    All waveforms are normalised and sliced to LEAD_IDX at construction time
-    so __getitem__ is a pure tensor index with no disk I/O.
+    All waveforms are normalised at construction time; __getitem__ is a
+    pure tensor index with no disk I/O.
 
     Args:
         records: Record dicts for this split.
         embedding_cache: Dict mapping ecg_id → BioClinicalBERT embedding.
         mean: Per-lead mean of shape (N_LEADS,) from the training set.
         std: Per-lead std of shape (N_LEADS,) from the training set.
-        rpeak_cache: Dict mapping ecg_id → binary R-peak mask of shape (SEQ_LEN,).
     """
 
     def __init__(
@@ -340,7 +274,6 @@ class PTBXLDataset(Dataset):
         embedding_cache: dict[str, numpy.ndarray],
         mean: numpy.ndarray,
         std: numpy.ndarray,
-        rpeak_cache: dict[str, numpy.ndarray] | None = None,
     ) -> None:
         mean_t = torch.from_numpy(mean[:, None])
         std_t = torch.from_numpy(std[:, None])
@@ -349,7 +282,7 @@ class PTBXLDataset(Dataset):
         print(f"  preloading {n} waveforms into RAM…")
         waveforms = _preload_waveforms(records)
 
-        ecgs, text_embs, rids, labels, rpeaks = [], [], [], [], []
+        ecgs, text_embs, rids, labels = [], [], [], []
         for i, rec in enumerate(records):
             rid = str(rec["ecg_id"])
             ecg = torch.from_numpy(waveforms[i])
@@ -359,25 +292,19 @@ class PTBXLDataset(Dataset):
             text_embs.append(torch.from_numpy(embedding_cache[rid]))
             rids.append(rid)
             labels.append(int(rec["label"]))
-            if rpeak_cache is not None and rid in rpeak_cache:
-                rpeaks.append(torch.from_numpy(rpeak_cache[rid]).unsqueeze(0))  # (1, SEQ_LEN)
-            else:
-                rpeaks.append(torch.zeros(1, SEQ_LEN))
 
         self.ecgs = torch.stack(ecgs)
         self.text_embs = torch.nn.functional.normalize(torch.stack(text_embs), dim=-1)
-        self.rpeaks = torch.stack(rpeaks)
         self.rids = rids
         self.labels = labels
 
     def __len__(self) -> int:
         return len(self.rids)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         return {
             "ecg": self.ecgs[idx],
             "text_emb": self.text_embs[idx],
-            "r_peak_mask": self.rpeaks[idx],
             "record_id": self.rids[idx],
             "label": self.labels[idx],
         }
@@ -386,13 +313,8 @@ class PTBXLDataset(Dataset):
 class PTBXLMultiLeadDataset(Dataset):
     """PTB-XL dataset expanded to all 12 leads.
 
-    Each PTB-XL recording yields 12 training samples — one per lead — with a
-    ``lead_idx`` key (0–11) so the model can condition on lead identity.
-
-    R-peak masks are shared across all 12 leads of the same recording: the mask
-    is always detected from Lead II (strongest QRS) since cardiac beat positions
-    are the same regardless of recording angle.
-
+    Each recording yields 12 training samples — one per lead — with a
+    ``lead_idx`` key (0–11) for lead-identity conditioning.
     Effective dataset size is 12× the number of recordings.
 
     Args:
@@ -400,7 +322,6 @@ class PTBXLMultiLeadDataset(Dataset):
         embedding_cache: Dict mapping ecg_id → BioClinicalBERT embedding.
         mean: Per-lead mean of shape (N_LEADS,) from the training set.
         std: Per-lead std of shape (N_LEADS,) from the training set.
-        rpeak_cache: Dict mapping ecg_id → binary R-peak mask of shape (SEQ_LEN,).
     """
 
     def __init__(
@@ -409,36 +330,28 @@ class PTBXLMultiLeadDataset(Dataset):
         embedding_cache: dict[str, numpy.ndarray],
         mean: numpy.ndarray,
         std: numpy.ndarray,
-        rpeak_cache: dict[str, numpy.ndarray] | None = None,
     ) -> None:
-        mean_t = torch.from_numpy(mean[:, None])   # (N_LEADS, 1)
-        std_t = torch.from_numpy(std[:, None])     # (N_LEADS, 1)
+        mean_t = torch.from_numpy(mean[:, None])
+        std_t = torch.from_numpy(std[:, None])
 
         n = len(records)
         print(f"  preloading {n} waveforms (all 12 leads) into RAM…")
         waveforms = _preload_waveforms(records)
 
-        # Store all 12 leads normalised: (N, 12, SEQ_LEN)
-        ecgs_all, text_embs_all, rids_all, labels_all, rpeaks_all = [], [], [], [], []
+        ecgs_all, text_embs_all, rids_all, labels_all = [], [], [], []
         for i, rec in enumerate(records):
             rid = str(rec["ecg_id"])
-            ecg = torch.from_numpy(waveforms[i])   # (12, SEQ_LEN)
-            ecg = (ecg - mean_t) / std_t           # per-lead normalisation
+            ecg = torch.from_numpy(waveforms[i])
+            ecg = (ecg - mean_t) / std_t
             ecgs_all.append(ecg)
             text_embs_all.append(torch.from_numpy(embedding_cache[rid]))
             rids_all.append(rid)
             labels_all.append(int(rec["label"]))
-            if rpeak_cache is not None and rid in rpeak_cache:
-                rpeaks_all.append(torch.from_numpy(rpeak_cache[rid]).unsqueeze(0))  # (1, SEQ_LEN)
-            else:
-                rpeaks_all.append(torch.zeros(1, SEQ_LEN))
 
-        # (N, 12, SEQ_LEN)
-        self._ecgs = torch.stack(ecgs_all)
-        # (N, 768) — L2-normalised so all embeddings sit on the unit sphere
-        self._text_embs = torch.nn.functional.normalize(torch.stack(text_embs_all), dim=-1)
-        # (N, 1, SEQ_LEN) — shared across all 12 leads per recording
-        self._rpeaks = torch.stack(rpeaks_all)
+        self._ecgs = torch.stack(ecgs_all)                                      # (N, 12, SEQ_LEN)
+        self._text_embs = torch.nn.functional.normalize(
+            torch.stack(text_embs_all), dim=-1
+        )                                                                        # (N, 768)
         self._rids = rids_all
         self._labels = labels_all
         self._n_recordings = n
@@ -446,14 +359,13 @@ class PTBXLMultiLeadDataset(Dataset):
     def __len__(self) -> int:
         return self._n_recordings * N_LEADS
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         rec_idx = idx // N_LEADS
         lead = idx % N_LEADS
         return {
             "ecg": self._ecgs[rec_idx, lead: lead + 1, :],   # (1, SEQ_LEN)
             "text_emb": self._text_embs[rec_idx],
             "lead_idx": lead,
-            "r_peak_mask": self._rpeaks[rec_idx],             # (1, SEQ_LEN)
             "record_id": self._rids[rec_idx],
             "label": self._labels[rec_idx],
         }
@@ -468,10 +380,10 @@ def build_datasets(
     """Load PTB-XL, cache BERT embeddings and ECG stats, return all three splits.
 
     Args:
-        data_dir: Root of the PTB-XL PhysioNet directory.
+        data_dir: Root of the processed PTB-XL directory.
         cache_dir: Directory for bert_embeddings.pkl and ecg_stats.pkl.
         bert_device: Device for BioClinicalBERT encoding.
-        multi_lead: If True, return PTBXLMultiLeadDataset (12× data, with
+        multi_lead: If True return PTBXLMultiLeadDataset (12× data, with
             lead_idx per sample) instead of single-lead PTBXLDataset.
 
     Returns:
@@ -497,14 +409,9 @@ def build_datasets(
         with open(stats_path, "wb") as f:
             pickle.dump((mean, std), f)
 
-    rpeak_cache = build_rpeak_cache(
-        train_recs + val_recs + test_recs,
-        Path(cache_dir) / "rpeak_masks.pkl",
-    )
-
     cls = PTBXLMultiLeadDataset if multi_lead else PTBXLDataset
     return (
-        cls(train_recs, emb_cache, mean, std, rpeak_cache),
-        cls(val_recs, emb_cache, mean, std, rpeak_cache),
-        cls(test_recs, emb_cache, mean, std, rpeak_cache),
+        cls(train_recs, emb_cache, mean, std),
+        cls(val_recs,   emb_cache, mean, std),
+        cls(test_recs,  emb_cache, mean, std),
     )
