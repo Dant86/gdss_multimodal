@@ -52,6 +52,7 @@ echo "LOG_DIR   = ${LOG_DIR}"
 python apps/fetch_data/main.py \
     --data-dir  "${DATA_DIR}" \
     --cache-dir "${CACHE_DIR}" \
-    --bert-device cpu
+    --bert-device cpu \
+    "$@"
 
 echo "[$(date)] Done."

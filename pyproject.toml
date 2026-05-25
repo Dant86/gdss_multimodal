@@ -16,7 +16,6 @@ dependencies = [
     "wfdb>=4.1.0",
     # PTB-XL fetch pipeline
     "anthropic>=0.25.0",
-    "langdetect>=1.0.9",
     "kaggle>=1.6.0",
     # Config & environment
     "pyyaml>=6.0",
