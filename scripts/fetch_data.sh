@@ -2,7 +2,7 @@
 # SLURM job: download, translate, and process PTB-XL.
 #
 # Reads cluster config from .env in the project root.
-# Typical runtime: 30–90 min depending on batch API latency.
+# Typical runtime: 15–30 min (concurrent sync API calls, concurrency=50).
 #
 # Submit: sbatch scripts/fetch_data.sh
 #
@@ -15,7 +15,7 @@
 #SBATCH --qos=general
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
