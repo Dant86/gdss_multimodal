@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     # Deep learning
     "torch>=2.1.0",
-    "transformers==4.44.2",
+    "transformers>=4.44.2",
     "huggingface_hub>=0.22.0",
     "accelerate>=0.29.0",
     # Data processing
