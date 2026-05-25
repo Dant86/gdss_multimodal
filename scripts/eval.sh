@@ -10,8 +10,10 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=gdss_eval
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
+#SBATCH --partition=general
+#SBATCH --qos=general
+#SBATCH --output=logs/eval_%j.out
+#SBATCH --error=logs/eval_%j.err
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

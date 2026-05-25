@@ -10,8 +10,10 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=gdss_pretrain
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
+#SBATCH --partition=general
+#SBATCH --qos=general
+#SBATCH --output=logs/pretrain_%j.out
+#SBATCH --error=logs/pretrain_%j.err
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

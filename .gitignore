@@ -3,6 +3,7 @@ tmp/
 cache/
 checkpoints/
 samples/
+logs/
 
 # Python
 __pycache__/

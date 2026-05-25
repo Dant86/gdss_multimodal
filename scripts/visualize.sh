@@ -10,8 +10,10 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=gdss_viz
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
+#SBATCH --partition=general
+#SBATCH --qos=general
+#SBATCH --output=logs/visualize_%j.out
+#SBATCH --error=logs/visualize_%j.err
 #SBATCH --time=02:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

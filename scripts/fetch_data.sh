@@ -8,8 +8,10 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=gdss_fetch
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
+#SBATCH --partition=general
+#SBATCH --qos=general
+#SBATCH --output=logs/fetch_data_%j.out
+#SBATCH --error=logs/fetch_data_%j.err
 #SBATCH --time=02:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
