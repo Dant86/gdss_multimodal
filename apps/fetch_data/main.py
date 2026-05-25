@@ -24,7 +24,7 @@ Usage
 -----
     python apps/fetch_data/main.py [--data-dir DIR] [--cache-dir DIR]
                                    [--bert-device cpu|cuda]
-                                   [--translation-model claude-haiku-3-5-20241022]
+                                   [--translation-model claude-3-5-haiku-20241022]
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ SYSTEM_PROMPT = (
 def _normalise_batch(
     texts: list[str],
     ecg_ids: list[int],
-    model: str = "claude-haiku-3-5-20241022",
+    model: str = "claude-3-5-haiku-20241022",
 ) -> dict[int, str]:
     """Submit all reports to the Batch API and return English text for each.
 
@@ -157,7 +157,7 @@ def run(
     data_dir: Path,
     cache_dir: Path,
     bert_device: str = "cpu",
-    translation_model: str = "claude-haiku-3-5-20241022",
+    translation_model: str = "claude-3-5-haiku-20241022",
     staging_dir: Path | None = None,
     skip_download: bool = False,
 ) -> None:
@@ -281,7 +281,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--translation-model",
-        default="claude-haiku-3-5-20241022",
+        default="claude-3-5-haiku-20241022",
         help="Anthropic model for report normalisation.",
     )
     parser.add_argument(
