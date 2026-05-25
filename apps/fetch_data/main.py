@@ -138,14 +138,24 @@ def _normalise_batch(
         time.sleep(30)
 
     results: dict[int, str] = {}
+    errors: list[str] = []
     for result in client.messages.batches.results(batch_id):
         eid = int(result.custom_id)
         if result.result.type == "succeeded":
             results[eid] = result.result.message.content[0].text.strip()
         else:
             results[eid] = ""
+            if len(errors) < 5:
+                errors.append(f"  ecg_id={eid}: {result.result}")
 
-    print(f"  Batch complete: {len(results)} results.")
+    n_ok  = len(results) - len(errors)
+    n_err = sum(1 for v in results.values() if v == "")
+    print(f"  Batch complete: {len(results)} results, {n_ok} succeeded, {n_err} errored.")
+    if errors:
+        print("  Sample errors (first 5):")
+        for e in errors:
+            print(e)
+
     return results
 
 
