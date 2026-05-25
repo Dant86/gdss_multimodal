@@ -7,13 +7,16 @@
 #
 # Submit: sbatch scripts/visualize.sh
 # Custom checkpoint: sbatch scripts/visualize.sh --checkpoint step_0050000.pt
+#
+# Log paths are set after sourcing .env — SLURM directives can't read env files,
+# so we start with /dev/null and exec-redirect once LOG_DIR is known.
 # ──────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=gdss_viz
 #SBATCH --partition=general
 #SBATCH --qos=general
-#SBATCH --output=logs/visualize_%j.out
-#SBATCH --error=logs/visualize_%j.err
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
 #SBATCH --time=02:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
@@ -22,56 +25,47 @@
 
 set -euo pipefail
 
-# ── Load environment ──────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-ENV_FILE="$PROJECT_DIR/.env"
+export PYTHONUNBUFFERED=1
 
-if [[ -f "$ENV_FILE" ]]; then
-    set -a; source "$ENV_FILE"; set +a
+cd "$SLURM_SUBMIT_DIR"
+
+if [[ ! -f .env ]]; then
+    echo "ERROR: .env not found in ${SLURM_SUBMIT_DIR}. Copy .env.sample and fill in your values." >&2
+    exit 1
 fi
+source .env
 
 [[ -n "${SLURM_PARTITION:-}" ]] && SBATCH_PARTITION="$SLURM_PARTITION"
 [[ -n "${SLURM_ACCOUNT:-}"   ]] && SBATCH_ACCOUNT="$SLURM_ACCOUNT"
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-LOG_DIR="${LOG_DIR:-$PROJECT_DIR/logs}"
-mkdir -p "$LOG_DIR"
-exec >"$LOG_DIR/visualize_${SLURM_JOB_ID:-local}.out" \
-    2>"$LOG_DIR/visualize_${SLURM_JOB_ID:-local}.err"
+mkdir -p "${LOG_DIR}"
+exec > "${LOG_DIR}/visualize_${SLURM_JOB_ID}.out" \
+     2> "${LOG_DIR}/visualize_${SLURM_JOB_ID}.err"
 
 # ── Activate virtualenv ───────────────────────────────────────────────────────
-VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
-source "$VENV_DIR/bin/activate"
+source "${VENV_DIR}/bin/activate"
 
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-cd "$PROJECT_DIR"
-
-CKPT="${CHECKPOINT_DIR:-checkpoints}/final.pt"
-
-echo "=== visualize  $(date) ==="
-echo "DATA_DIR    = ${DATA_DIR:-data/ptbxl}"
-echo "CACHE_DIR   = ${CACHE_DIR:-cache}"
-echo "FIGURES_DIR = ${FIGURES_DIR:-figures}"
-echo "CHECKPOINT  = $CKPT"
-echo "LOG_DIR     = $LOG_DIR"
-
-EXTRA_ARGS="${@:-}"
+echo "[$(date)] Starting visualize (job ${SLURM_JOB_ID})"
+echo "DATA_DIR    = ${DATA_DIR}"
+echo "CACHE_DIR   = ${CACHE_DIR}"
+echo "FIGURES_DIR = ${FIGURES_DIR}"
+echo "LOG_DIR     = ${LOG_DIR}"
 
 python apps/visualize/main.py \
-    --checkpoint  "$CKPT" \
-    --data-dir    "${DATA_DIR:-data/ptbxl}" \
-    --cache-dir   "${CACHE_DIR:-cache}" \
-    --output-dir  "${FIGURES_DIR:-figures}" \
+    --checkpoint  "${CHECKPOINT_DIR}/final.pt" \
+    --data-dir    "${DATA_DIR}" \
+    --cache-dir   "${CACHE_DIR}" \
+    --output-dir  "${FIGURES_DIR}" \
     --n-real      400 \
     --n-gen       300 \
     --device      cuda \
     --sampler     pc \
     --n-steps     500 \
     --cfg-scale   1.5 \
-    $EXTRA_ARGS
+    "$@"
 
-echo "=== done $(date) ==="
+echo "[$(date)] Done."

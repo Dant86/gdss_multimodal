@@ -9,13 +9,16 @@
 #   sbatch scripts/train.sh --pretrain-checkpoint checkpoints/pretrain_final.pt
 # Resume:
 #   sbatch scripts/train.sh --resume-checkpoint checkpoints/step_0050000.pt
+#
+# Log paths are set after sourcing .env — SLURM directives can't read env files,
+# so we start with /dev/null and exec-redirect once LOG_DIR is known.
 # ──────────────────────────────────────────────────────────────────────────────
 
 #SBATCH --job-name=gdss_train
 #SBATCH --partition=general
 #SBATCH --qos=general
-#SBATCH --output=logs/train_%j.out
-#SBATCH --error=logs/train_%j.err
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
 #SBATCH --time=12:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -24,51 +27,44 @@
 
 set -euo pipefail
 
-# ── Load environment ──────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-ENV_FILE="$PROJECT_DIR/.env"
+export PYTHONUNBUFFERED=1
 
-if [[ -f "$ENV_FILE" ]]; then
-    set -a; source "$ENV_FILE"; set +a
+cd "$SLURM_SUBMIT_DIR"
+
+if [[ ! -f .env ]]; then
+    echo "ERROR: .env not found in ${SLURM_SUBMIT_DIR}. Copy .env.sample and fill in your values." >&2
+    exit 1
 fi
+source .env
 
 [[ -n "${SLURM_PARTITION:-}" ]] && SBATCH_PARTITION="$SLURM_PARTITION"
 [[ -n "${SLURM_ACCOUNT:-}"   ]] && SBATCH_ACCOUNT="$SLURM_ACCOUNT"
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-LOG_DIR="${LOG_DIR:-$PROJECT_DIR/logs}"
-mkdir -p "$LOG_DIR"
-exec >"$LOG_DIR/train_${SLURM_JOB_ID:-local}.out" \
-    2>"$LOG_DIR/train_${SLURM_JOB_ID:-local}.err"
+mkdir -p "${LOG_DIR}"
+exec > "${LOG_DIR}/train_${SLURM_JOB_ID}.out" \
+     2> "${LOG_DIR}/train_${SLURM_JOB_ID}.err"
 
 # ── Activate virtualenv ───────────────────────────────────────────────────────
-VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
-source "$VENV_DIR/bin/activate"
+source "${VENV_DIR}/bin/activate"
 
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-cd "$PROJECT_DIR"
-
-echo "=== train  $(date) ==="
-echo "DATA_DIR        = ${DATA_DIR:-data/ptbxl}"
-echo "CACHE_DIR       = ${CACHE_DIR:-cache}"
-echo "CHECKPOINT_DIR  = ${CHECKPOINT_DIR:-checkpoints}"
-echo "LOG_DIR         = $LOG_DIR"
-
-# Extra CLI args forwarded from sbatch (e.g. --pretrain-checkpoint, --resume-checkpoint)
-EXTRA_ARGS="${@:-}"
+echo "[$(date)] Starting train (job ${SLURM_JOB_ID})"
+echo "DATA_DIR       = ${DATA_DIR}"
+echo "CACHE_DIR      = ${CACHE_DIR}"
+echo "CHECKPOINT_DIR = ${CHECKPOINT_DIR}"
+echo "LOG_DIR        = ${LOG_DIR}"
 
 python apps/train/main.py \
-    --data-dir        "${DATA_DIR:-data/ptbxl}" \
-    --cache-dir       "${CACHE_DIR:-cache}" \
-    --checkpoint-dir  "${CHECKPOINT_DIR:-checkpoints}" \
+    --data-dir        "${DATA_DIR}" \
+    --cache-dir       "${CACHE_DIR}" \
+    --checkpoint-dir  "${CHECKPOINT_DIR}" \
     --batch-size      256 \
     --max-steps       100000 \
     --lr              3e-4 \
     --device          cuda \
-    $EXTRA_ARGS
+    "$@"
 
-echo "=== done $(date) ==="
+echo "[$(date)] Done."
