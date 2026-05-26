@@ -56,6 +56,16 @@ source "${VENV_DIR}/bin/activate"
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
+# ── Auto-detect pretrain checkpoint ──────────────────────────────────────────
+PRETRAIN_CKPT="${CHECKPOINT_DIR}/pretrain_final.pt"
+if [[ -f "${PRETRAIN_CKPT}" ]]; then
+    echo "Found pretrain checkpoint: ${PRETRAIN_CKPT}"
+    PRETRAIN_ARG="--pretrain-checkpoint ${PRETRAIN_CKPT}"
+else
+    echo "No pretrain checkpoint found — training from random init."
+    PRETRAIN_ARG=""
+fi
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 echo "[$(date)] Starting train (job ${SLURM_JOB_ID})"
 echo "DATA_DIR       = ${DATA_DIR}"
@@ -72,6 +82,7 @@ python apps/train/main.py \
     --lr              3e-4 \
     --device          cuda \
     train.num_workers=0 \
+    ${PRETRAIN_ARG} \
     "$@"
 
 echo "[$(date)] Done."
