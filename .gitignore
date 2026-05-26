@@ -39,5 +39,4 @@ venv/
 # Modal
 .modal.toml
 
-figures/
 tikz/
