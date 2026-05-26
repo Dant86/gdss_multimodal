@@ -2,7 +2,7 @@
 name = "gdss-multimodal"
 version = "0.2.0"
 description = "Joint ECG–text diffusion via generalised S4 symmetric splitting"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     # Deep learning
     "torch>=2.1.0",
