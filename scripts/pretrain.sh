@@ -50,25 +50,9 @@ source "${VENV_DIR}/bin/activate"
 TORCH_LIB="$(python -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).parent / "lib")')"
 export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 
-# ── Synchronous CUDA for debugging — remove once stable ──────────────────────
-export CUDA_LAUNCH_BLOCKING=1
-
-# ── cuDNN / library diagnostics ──────────────────────────────────────────────
-echo "TORCH_LIB       = ${TORCH_LIB}"
-echo "LD_LIBRARY_PATH = ${LD_LIBRARY_PATH}"
 
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
-
-# ── CUDA sanity check ────────────────────────────────────────────────────────
-python -c "
-import torch
-print('CUDA available:', torch.cuda.is_available())
-print('Device count:  ', torch.cuda.device_count())
-x = torch.zeros(1).cuda()
-print('CUDA tensor OK:', x.device)
-print('cuDNN enabled: ', torch.backends.cudnn.enabled)
-"
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 echo "[$(date)] Starting pretrain (job ${SLURM_JOB_ID})"
