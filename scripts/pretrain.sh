@@ -73,6 +73,7 @@ python apps/pretrain/main.py \
     --lr              1e-3 \
     --spectral-weight 0.1 \
     --device          cuda \
+    train.num_workers=0 \
     "$@"
 
 echo "[$(date)] Done."
