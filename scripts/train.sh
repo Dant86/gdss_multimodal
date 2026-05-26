@@ -45,6 +45,11 @@ mkdir -p "${LOG_DIR}"
 exec > "${LOG_DIR}/train_${SLURM_JOB_ID}.out" \
      2> "${LOG_DIR}/train_${SLURM_JOB_ID}.err"
 
+# ── Pin CUDA 12.4 (highest version available on this cluster) ─────────────────
+export CUDA_HOME=/usr/local/cuda-12.4
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+export PATH="${CUDA_HOME}/bin:${PATH}"
+
 # ── Activate virtualenv ───────────────────────────────────────────────────────
 source "${VENV_DIR}/bin/activate"
 
@@ -66,6 +71,7 @@ python apps/train/main.py \
     --max-steps       100000 \
     --lr              3e-4 \
     --device          cuda \
+    train.num_workers=0 \
     "$@"
 
 echo "[$(date)] Done."
