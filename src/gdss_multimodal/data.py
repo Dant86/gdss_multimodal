@@ -108,12 +108,26 @@ def load_ptbxl_records(data_dir: str | Path) -> list[dict[str, Any]]:
     except Exception:
         df["label"] = -1
 
+    # Substrings that indicate a Claude API error/refusal leaked into report_en.
+    _CONTAMINATION_MARKERS = (
+        "no ecg report text was provided",
+        "i'm ready to help",
+        "please provide the cardiology ecg report",
+        "please provide",
+        "i cannot",
+        "i'm unable",
+    )
+
     records = []
     skipped = 0
+    contaminated = 0
     for ecg_id, row in df.iterrows():
         report = str(row.get(report_col, "")).strip()
         if not report or report.lower() in ("nan", "none", ""):
             skipped += 1
+            continue
+        if any(marker in report.lower() for marker in _CONTAMINATION_MARKERS):
+            contaminated += 1
             continue
         records.append({
             "ecg_id": int(ecg_id),
@@ -126,6 +140,8 @@ def load_ptbxl_records(data_dir: str | Path) -> list[dict[str, Any]]:
 
     if skipped:
         print(f"  skipped {skipped} records with empty reports.")
+    if contaminated:
+        print(f"  skipped {contaminated} records with contaminated report_en (Claude API artefacts).")
     return records
 
 

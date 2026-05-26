@@ -62,7 +62,7 @@ def _init_ema(model) -> dict:
     return {k: v.clone() for k, v in _unwrap(model).state_dict().items()}
 
 
-def _update_ema(ema: dict, model, decay: float = 0.9999) -> None:
+def _update_ema(ema: dict, model, decay: float = 0.999) -> None:
     """Update EMA shadow in-place: shadow = decay·shadow + (1−decay)·param."""
     with torch.no_grad():
         for k, v in _unwrap(model).state_dict().items():
@@ -311,30 +311,36 @@ def _train_worker(
         print(f"Training on {device} (world_size={world_size}), "
               f"max_steps={cfg.train.max_steps}, bf16={use_amp}")
 
+    grad_accum = max(1, cfg.train.grad_accum)
+
     while step < cfg.train.max_steps:
         if ddp and train_sampler is not None:
             train_sampler.set_epoch(step // max(1, len(train_loader)))
 
-        try:
-            batch = next(loader_iter)
-        except StopIteration:
-            loader_iter = iter(train_loader)
-            batch = next(loader_iter)
-
-        ecg0  = batch["ecg"].to(device)
-        text0 = batch["text_emb"].to(device)
-        lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
-
         optimiser.zero_grad()
-        with autocast:
-            loss = dsm_loss(
-                s_theta, s_phi, ecg0, text0, vpsde,
-                cfg.train.likelihood_weighting,
-                lead_idx,
-                cfg_drop_prob=cfg.train.cfg_drop_prob,
-            )
-        loss = loss.clamp(max=50.0).nan_to_num(0.0)
-        loss.backward()
+        accum_loss = 0.0
+        for _ in range(grad_accum):
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(train_loader)
+                batch = next(loader_iter)
+
+            ecg0  = batch["ecg"].to(device)
+            text0 = batch["text_emb"].to(device)
+            lead_idx = batch["lead_idx"].to(device) if "lead_idx" in batch else None
+
+            with autocast:
+                loss = dsm_loss(
+                    s_theta, s_phi, ecg0, text0, vpsde,
+                    cfg.train.likelihood_weighting,
+                    lead_idx,
+                    cfg_drop_prob=cfg.train.cfg_drop_prob,
+                )
+            loss = (loss / grad_accum).clamp(max=50.0).nan_to_num(0.0)
+            loss.backward()
+            accum_loss += loss.item()
+
         nn.utils.clip_grad_norm_(params, cfg.train.grad_clip)
         optimiser.step()
         scheduler.step()
@@ -343,7 +349,7 @@ def _train_worker(
         if is_main:
             _update_ema(ema_theta, s_theta)
             _update_ema(ema_phi,   s_phi)
-            raw = loss.item()
+            raw = accum_loss
             loss_ema = raw if loss_ema is None else 0.98 * loss_ema + 0.02 * raw
 
             if step % cfg.train.log_every == 0:

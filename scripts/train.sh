@@ -82,6 +82,7 @@ python apps/train/main.py \
     --lr              3e-4 \
     --device          cuda \
     train.num_workers=0 \
+    train.grad_accum=4 \
     ${PRETRAIN_ARG} \
     "$@"
 

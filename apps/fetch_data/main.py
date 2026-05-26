@@ -224,7 +224,22 @@ def run(
         normalised = _normalise_batch(batch_texts, batch_ids, model=translation_model)
 
         # ── 5. Write report_en column ────────────────────────────────────────
+        _CONTAMINATION_MARKERS = (
+            "no ecg report text was provided",
+            "i'm ready to help",
+            "please provide the cardiology ecg report",
+            "please provide",
+            "i cannot",
+            "i'm unable",
+        )
         df["report_en"] = pandas.Series(normalised).reindex(df.index, fill_value="")
+        contaminated_mask = df["report_en"].str.lower().apply(
+            lambda t: any(m in t for m in _CONTAMINATION_MARKERS)
+        )
+        n_contaminated = int(contaminated_mask.sum())
+        if n_contaminated:
+            df.loc[contaminated_mask, "report_en"] = ""
+            print(f"  Zeroed {n_contaminated} contaminated report_en values (Claude API artefacts).")
         n_usable = (df["report_en"].str.strip() != "").sum()
         print(f"  Usable records with report_en: {n_usable}/{len(df)}")
 

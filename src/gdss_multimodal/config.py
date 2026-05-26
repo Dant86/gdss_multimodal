@@ -32,7 +32,7 @@ import yaml
 @dataclass
 class SDEConfig:
     beta_min: float = 0.1
-    beta_max: float = 12.0
+    beta_max: float = 1.0
     T: float = 1.0
     eps: float = 1e-5
 
@@ -87,6 +87,7 @@ class TrainConfig:
     checkpoint_dir: str = "checkpoints"
     # Data
     batch_size: int = 256
+    grad_accum: int = 1   # effective batch = batch_size × grad_accum
     num_workers: int = 4
     # Optimisation
     lr: float = 3e-4
