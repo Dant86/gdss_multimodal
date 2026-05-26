@@ -50,6 +50,9 @@ source "${VENV_DIR}/bin/activate"
 TORCH_LIB="$(python -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).parent / "lib")')"
 export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 
+# ── Synchronous CUDA for debugging — remove once stable ──────────────────────
+export CUDA_LAUNCH_BLOCKING=1
+
 # ── cuDNN / library diagnostics ──────────────────────────────────────────────
 echo "TORCH_LIB       = ${TORCH_LIB}"
 echo "LD_LIBRARY_PATH = ${LD_LIBRARY_PATH}"
