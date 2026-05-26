@@ -169,6 +169,7 @@ def run(
     translation_model: str = "claude-haiku-4-5-20251001",
     staging_dir: Path | None = None,
     skip_download: bool = False,
+    skip_translation: bool = False,
 ) -> None:
     """Run the full fetch-and-process pipeline.
 
@@ -180,12 +181,14 @@ def run(
         staging_dir: Temporary directory for the Kaggle download.
         skip_download: If True, skip Kaggle download and read the CSV
             directly from data_dir (waveforms must already be in place).
+        skip_translation: If True, skip the Batch API translation step and
+            read report_en directly from the existing CSV in data_dir.
     """
     if staging_dir is None:
         staging_dir = data_dir.parent / "_ptbxl_staging"
 
     # ── 1. Download ──────────────────────────────────────────────────────────
-    if skip_download:
+    if skip_download or skip_translation:
         print("Skipping Kaggle download — reading existing data from data_dir.")
         csv_path = data_dir / data_module.PTBXL_CSV
     else:
@@ -197,36 +200,42 @@ def run(
     df = pandas.read_csv(csv_path, index_col="ecg_id")
     print(f"Loaded {len(df)} records from {csv_path}")
 
-    # ── 3. Collect non-empty reports ─────────────────────────────────────────
-    reports = df.get("report", pandas.Series(dtype=str)).fillna("").astype(str)
+    if skip_translation:
+        print("Skipping translation — using existing report_en column.")
+        n_usable = (df.get("report_en", pandas.Series(dtype=str)).fillna("").str.strip() != "").sum()
+        print(f"  Usable records with report_en: {n_usable}/{len(df)}")
+    else:
+        # ── 3. Collect non-empty reports ─────────────────────────────────────
+        reports = df.get("report", pandas.Series(dtype=str)).fillna("").astype(str)
 
-    batch_ids, batch_texts = [], []
-    skipped = 0
-    for ecg_id, text in reports.items():
-        text = text.strip()
-        if not text or text.lower() in ("nan", "none"):
-            skipped += 1
-            continue
-        batch_ids.append(ecg_id)
-        batch_texts.append(text)
+        batch_ids, batch_texts = [], []
+        skipped = 0
+        for ecg_id, text in reports.items():
+            text = text.strip()
+            if not text or text.lower() in ("nan", "none"):
+                skipped += 1
+                continue
+            batch_ids.append(ecg_id)
+            batch_texts.append(text)
 
-    print(f"  Sending {len(batch_ids)} reports to Claude ({skipped} empty, skipped).")
+        print(f"  Sending {len(batch_ids)} reports to Claude ({skipped} empty, skipped).")
 
-    # ── 4. Normalise via Batch API ───────────────────────────────────────────
-    normalised = _normalise_batch(batch_texts, batch_ids, model=translation_model)
+        # ── 4. Normalise via Batch API ───────────────────────────────────────
+        normalised = _normalise_batch(batch_texts, batch_ids, model=translation_model)
 
-    # ── 5. Write report_en column ────────────────────────────────────────────
-    df["report_en"] = pandas.Series(normalised).reindex(df.index, fill_value="")
-    n_usable = (df["report_en"].str.strip() != "").sum()
-    print(f"  Usable records with report_en: {n_usable}/{len(df)}")
+        # ── 5. Write report_en column ────────────────────────────────────────
+        df["report_en"] = pandas.Series(normalised).reindex(df.index, fill_value="")
+        n_usable = (df["report_en"].str.strip() != "").sum()
+        print(f"  Usable records with report_en: {n_usable}/{len(df)}")
 
     # ── 6. Write CSV (and copy waveforms if downloaded) ─────────────────────
     data_dir.mkdir(parents=True, exist_ok=True)
-    dest_csv = data_dir / data_module.PTBXL_CSV
-    df.to_csv(dest_csv)
-    print(f"  Saved updated CSV → {dest_csv}")
+    if not skip_translation:
+        dest_csv = data_dir / data_module.PTBXL_CSV
+        df.to_csv(dest_csv)
+        print(f"  Saved updated CSV → {dest_csv}")
 
-    if not skip_download:
+    if not skip_download and not skip_translation:
         records_src = raw_dir / data_module.RECORDS_DIR
         records_dst = data_dir / data_module.RECORDS_DIR
         if records_dst.exists():
@@ -258,7 +267,7 @@ def run(
         print(f"  Embedding cache already exists at {emb_cache_path}, skipping.")
 
     # ── 9. Delete staging directory (only if we created it) ─────────────────
-    if not skip_download and staging_dir.exists():
+    if not skip_download and not skip_translation and staging_dir.exists():
         print(f"Deleting staging directory {staging_dir}…")
         shutil.rmtree(staging_dir)
     print("Done.")
@@ -298,6 +307,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip Kaggle download; read CSV and waveforms from --data-dir directly.",
     )
+    parser.add_argument(
+        "--skip-translation",
+        action="store_true",
+        help="Skip Batch API translation; use existing report_en in --data-dir CSV.",
+    )
     return parser.parse_args()
 
 
@@ -311,4 +325,5 @@ if __name__ == "__main__":
         bert_device=args.bert_device,
         translation_model=args.translation_model,
         skip_download=args.skip_download,
+        skip_translation=args.skip_translation,
     )
