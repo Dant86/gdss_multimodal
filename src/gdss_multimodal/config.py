@@ -66,7 +66,7 @@ class TextScoreConfig:
 @dataclass
 class PretrainConfig:
     """Hyperparameters for the ECGUNet autoencoder pre-training phase."""
-    max_steps: int = 30_000
+    max_steps: int = 15_000
     batch_size: int = 512
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -74,7 +74,7 @@ class PretrainConfig:
     grad_clip: float = 1.0
     spectral_weight: float = 0.1
     log_every: int = 500
-    save_every: int = 10_000
+    save_every: int = 2_500
     checkpoint_dir: str = "checkpoints"
     resume: str = ""
 

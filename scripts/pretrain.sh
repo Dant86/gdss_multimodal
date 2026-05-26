@@ -66,7 +66,7 @@ python apps/pretrain/main.py \
     --cache-dir       "${CACHE_DIR}" \
     --checkpoint-dir  "${CHECKPOINT_DIR}" \
     --batch-size      512 \
-    --max-steps       30000 \
+    --max-steps       15000 \
     --lr              1e-3 \
     --spectral-weight 0.1 \
     --device          cuda \
