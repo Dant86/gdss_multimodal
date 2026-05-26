@@ -60,6 +60,16 @@ echo "LD_LIBRARY_PATH = ${LD_LIBRARY_PATH}"
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
+# ── CUDA sanity check ────────────────────────────────────────────────────────
+python -c "
+import torch
+print('CUDA available:', torch.cuda.is_available())
+print('Device count:  ', torch.cuda.device_count())
+x = torch.zeros(1).cuda()
+print('CUDA tensor OK:', x.device)
+print('cuDNN enabled: ', torch.backends.cudnn.enabled)
+"
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 echo "[$(date)] Starting pretrain (job ${SLURM_JOB_ID})"
 echo "DATA_DIR       = ${DATA_DIR}"
