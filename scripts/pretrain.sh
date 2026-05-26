@@ -50,6 +50,10 @@ source "${VENV_DIR}/bin/activate"
 TORCH_LIB="$(python -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).parent / "lib")')"
 export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
 
+# ── cuDNN / library diagnostics ──────────────────────────────────────────────
+echo "TORCH_LIB       = ${TORCH_LIB}"
+echo "LD_LIBRARY_PATH = ${LD_LIBRARY_PATH}"
+
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
