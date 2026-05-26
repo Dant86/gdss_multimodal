@@ -51,10 +51,6 @@ import gdss_multimodal.config as config_module
 import gdss_multimodal.data as data_module
 import gdss_multimodal.models as models_module
 
-# cuDNN sublibrary version mismatch on some cluster GPU nodes — disable and
-# fall back to native CUDA kernels (still fast on H200/A100).
-torch.backends.cudnn.enabled = False
-
 
 # ---------------------------------------------------------------------------
 # Spectral loss

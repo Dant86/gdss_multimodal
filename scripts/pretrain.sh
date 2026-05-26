@@ -46,9 +46,10 @@ exec > "${LOG_DIR}/pretrain_${SLURM_JOB_ID}.out" \
 # ── Activate virtualenv ───────────────────────────────────────────────────────
 source "${VENV_DIR}/bin/activate"
 
-# ── Force PyTorch's bundled cuDNN to take precedence over system cuDNN ────────
-TORCH_LIB="$(python -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).parent / "lib")')"
-export LD_LIBRARY_PATH="${TORCH_LIB}:${LD_LIBRARY_PATH:-}"
+# ── Pin CUDA 12.4 (highest version available on this cluster) ─────────────────
+export CUDA_HOME=/usr/local/cuda-12.4
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+export PATH="${CUDA_HOME}/bin:${PATH}"
 
 
 # ── GPU diagnostics ───────────────────────────────────────────────────────────
