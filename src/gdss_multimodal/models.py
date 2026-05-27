@@ -121,20 +121,29 @@ class _Down1D(nn.Module):
 
 
 class _Up1D(nn.Module):
-    """ConvTranspose1d upsample, merge skip via 1×1 conv, residual block."""
+    """ConvTranspose1d upsample, merge skip via 1×1 conv, residual block + attention."""
 
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, cond_dim: int) -> None:
+    def __init__(
+        self, in_ch: int, skip_ch: int, out_ch: int, cond_dim: int, use_attn: bool = False
+    ) -> None:
         super().__init__()
         self.up = nn.ConvTranspose1d(in_ch, out_ch, 4, stride=2, padding=1)
         self.merge = nn.Conv1d(out_ch + skip_ch, out_ch, 1)
         self.res = _ResBlock1D(out_ch, cond_dim)
+        self.attn = (
+            _SelfAttention1D(out_ch, n_heads=min(8, out_ch // 32), zero_init_output=True)
+            if use_attn else None
+        )
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
         if x.shape[-1] != skip.shape[-1]:
             x = x[..., : skip.shape[-1]]
         h = self.merge(torch.cat([x, skip], dim=1))
-        return self.res(h, cond)
+        h = self.res(h, cond)
+        if self.attn is not None:
+            h = self.attn(h)
+        return h
 
 
 class ECGUNet(nn.Module):
@@ -196,9 +205,9 @@ class ECGUNet(nn.Module):
         self.bottleneck_attn = _SelfAttention1D(bottleneck_ch, n_heads=8)
 
         self.ups = nn.ModuleList()
-        self.ups.append(_Up1D(bottleneck_ch, ch_list[-1], ch_list[-1], cond_dim))
+        self.ups.append(_Up1D(bottleneck_ch, ch_list[-1], ch_list[-1], cond_dim, use_attn=True))
         for i in range(len(ch_list) - 1, 0, -1):
-            self.ups.append(_Up1D(ch_list[i], ch_list[i - 1], ch_list[i - 1], cond_dim))
+            self.ups.append(_Up1D(ch_list[i], ch_list[i - 1], ch_list[i - 1], cond_dim, use_attn=True))
 
         self.output_norm = nn.GroupNorm(min(8, channels[0]), channels[0])
         self.output_conv = nn.Conv1d(channels[0], n_leads, 1)

@@ -149,11 +149,13 @@ def dsm_loss(
 
 
 def _ecg_rep(s_theta, ecg_t, text_t, t, lead_idx=None):
-    """Mean-pooled, L2-normalised ECG bottleneck (detached, no text bias)."""
+    """Mean-pooled, L2-normalised ECG bottleneck.
+
+    Gradients flow back into s_theta's encoder so the ECG representation
+    is jointly optimised for both ECG denoising and text alignment.
+    """
     m = _unwrap(s_theta)
-    with torch.no_grad():
-        h = m.encode(ecg_t, m.t_embed(t), lead_idx)
-    return h.detach()
+    return m.encode(ecg_t, m.t_embed(t), lead_idx)
 
 
 # ---------------------------------------------------------------------------
