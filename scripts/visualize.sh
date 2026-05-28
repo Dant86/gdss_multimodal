@@ -69,7 +69,7 @@ python apps/visualize/main.py \
     --n-real      400 \
     --n-gen       300 \
     --device      cuda \
-    --sampler     pc \
+    --sampler     s4 \
     --n-steps     500 \
     --cfg-scale   1.5 \
     "$@"

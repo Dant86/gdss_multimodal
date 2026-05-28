@@ -130,33 +130,48 @@ def _s4_step(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Single S4 step from time t to t − dt.
 
-    Symmetric splitting (Strang-style):
-        1. Half-corrector on M1 (Langevin, n_corrector steps)
-        2. Full predictor on M2 (reverse SDE Euler-Maruyama)
-        3. Half-corrector on M1 (symmetric counterpart of step 1)
+    Faithful to GDSS Algorithm 1 (arXiv:2202.02514):
+        1. Compute scores for both modalities jointly (once, before correctors).
+        2. Corrector (Langevin) on M1.
+        3. Corrector (Langevin) on M2.
+        4. Predictor (reverse SDE EM) on M1, using the pre-corrector score.
+        5. Predictor (reverse SDE EM) on M2, using the pre-corrector score.
+
+    Scores are evaluated once at the start and reused for the predictor drift,
+    matching GDSS's efficiency convention (score net is the bottleneck).
+    Both modalities receive both corrector and predictor steps, which is the
+    key difference from the plain PC sampler: the joint corrector synchronises
+    the two marginals before the predictor advances both forward in time.
 
     Args:
         m1: Current M1 sample.
         m2: Current M2 sample.
         t: Current timestep of shape (B,).
         dt: Step size.
-        s_theta: Score function for M1.
-        s_phi: Score function for M2.
+        s_theta: Score function for M1: s_θ(m1, m2, t).
+        s_phi: Score function for M2: s_φ(m2, m1, t).
         vpsde: VP-SDE instance.
         snr: Langevin corrector SNR hyperparameter.
-        n_corrector: Number of Langevin steps per half-corrector.
+        n_corrector: Number of Langevin steps per corrector phase.
 
     Returns:
         Updated (M1, M2) at time t − dt.
     """
+    # 1. Evaluate scores jointly before any updates.
+    score_m1 = _clip_score(s_theta(m1, m2, t), m1)
+    score_m2 = _clip_score(s_phi(m2, m1, t), m2)
+
+    # 2. Corrector on M1.
     for _ in range(n_corrector):
         m1 = _langevin_step(m1, m2, t, s_theta, snr)
 
-    score_m2 = s_phi(m2, m1, t)
+    # 3. Corrector on M2.
+    for _ in range(n_corrector):
+        m2 = _langevin_step(m2, m1, t, s_phi, snr)
+
+    # 4 & 5. Predictor on both modalities (EM reverse SDE, pre-corrector scores).
+    m1 = _reverse_sde_step(m1, score_m1, t, dt, vpsde)
     m2 = _reverse_sde_step(m2, score_m2, t, dt, vpsde)
-
-    for _ in range(n_corrector):
-        m1 = _langevin_step(m1, m2, t, s_theta, snr)
 
     return m1, m2
 
@@ -220,8 +235,14 @@ def pc_sampler(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Alternating predictor-corrector sampler (ablation baseline).
 
-    O(δt²) splitting error vs O(δt³) for S4.
-    Order per step: predict M1 → correct M1 → predict M2 → correct M2.
+    Order per step (matching GDSS convention):
+        1. Corrector on M1 at current t — Langevin keeps M1 on p_t.
+        2. Corrector on M2 at current t — same for M2.
+        3. Predictor on M1 — EM reverse SDE, advances M1 to t − dt.
+        4. Predictor on M2 — EM reverse SDE, advances M2 to t − dt.
+
+    Corrector-before-predictor ensures both modalities are well-positioned
+    on their current marginals before the joint time step is taken.
 
     Args:
         m1_T: M1 sample at t=T.
@@ -231,7 +252,7 @@ def pc_sampler(
         vpsde: VP-SDE instance.
         n_steps: Discretisation steps.
         snr: Corrector SNR.
-        n_corrector: Langevin corrector steps.
+        n_corrector: Langevin corrector steps per phase.
 
     Returns:
         Generated (M1, M2) samples.
@@ -241,14 +262,16 @@ def pc_sampler(
     m1, m2 = m1_T, m2_T
     for i in range(n_steps):
         t = ts[i].expand(m1.shape[0])
-        score_m1 = s_theta(m1, m2, t)
-        m1 = _reverse_sde_step(m1, score_m1, t, dt, vpsde)
+        # Correctors first — at current t, before advancing time.
         for _ in range(n_corrector):
             m1 = _langevin_step(m1, m2, t, s_theta, snr)
-        score_m2 = s_phi(m2, m1, t)
-        m2 = _reverse_sde_step(m2, score_m2, t, dt, vpsde)
         for _ in range(n_corrector):
             m2 = _langevin_step(m2, m1, t, s_phi, snr)
+        # Predictors — advance both modalities to t − dt.
+        score_m1 = s_theta(m1, m2, t)
+        score_m2 = s_phi(m2, m1, t)
+        m1 = _reverse_sde_step(m1, score_m1, t, dt, vpsde)
+        m2 = _reverse_sde_step(m2, score_m2, t, dt, vpsde)
     return m1, m2
 
 

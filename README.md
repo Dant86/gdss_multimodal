@@ -40,7 +40,7 @@ where the signal and noise scales are:
 
 $$\alpha(t) = \exp\left(-\frac{1}{2}\int_0^t \beta(s)ds\right), \qquad \sigma(t) = \sqrt{1 - \alpha(t)^2}$$
 
-Parameters: $\beta_{\min} = 0.1$, $\beta_{\max} = 1.0$ (following GDSS higher values create excessively noisy DSM targets). The same schedule is applied independently to $\mathbf{x}$ (ECG) and $\mathbf{y}$ (text embedding), yielding noisy pairs $(\mathbf{x}_t, \mathbf{y}_t)$ at each diffusion time $t$.
+Parameters: $\beta_{\min} = 0.1$, $\beta_{\max} = 1.0$ (following GDSS). The same schedule is applied independently to $\mathbf{x}$ (ECG) and $\mathbf{y}$ (text embedding), yielding noisy pairs $\mathbf{x}_t$ and $\mathbf{y}_t$ at each diffusion time $t$.
 
 ---
 
@@ -137,13 +137,14 @@ $$\mathcal{L}_{\mathrm{clipped}} = \mathrm{clamp}(\mathcal{L},\ \max=50) \cdot \
 
 ### Reverse sampler — S4
 
-The S4 sampler generalises the symmetric Strang splitting from GDSS (graph nodes ↔ adjacency) to arbitrary modality pairs (ECG ↔ text). One S4 step at time $t$:
+The S4 sampler generalises GDSS Algorithm 1 (graph nodes ↔ adjacency) to arbitrary modality pairs (ECG ↔ text). One S4 step at time $t$:
 
-1. **Half-corrector** on ECG — Langevin MCMC with adaptive step size $(\mathrm{snr} \cdot \|\mathbf{x}\| / \|s_\theta\|)^2$
-2. **Full predictor** on text — Euler-Maruyama reverse SDE step
-3. **Half-corrector** on ECG — symmetric counterpart of step 1
+1. **Joint score evaluation** — compute $s_\theta$ and $s_\phi$ once at the current $(M_1, M_2, t)$.
+2. **Corrector on ECG** — Langevin MCMC with adaptive step size $(\mathrm{snr} \cdot \|M_1\| / \|s_\theta\|)^2$.
+3. **Corrector on text** — Langevin MCMC with the same rule applied to $s_\phi$.
+4. **Predictor on both** — Euler-Maruyama reverse SDE step for each modality, using the pre-corrector scores from step 1.
 
-The symmetric arrangement reduces the local operator splitting error from $\mathcal{O}(\delta t^2)$ (plain alternating PC) to $\mathcal{O}(\delta t^3)$ via the Baker-Campbell-Hausdorff argument (GDSS Appendix B).
+Both modalities receive both a corrector and a predictor at every step. The joint corrector in steps 2–3 synchronises the two marginals before the predictor advances both in time, which is the key structural difference from the plain alternating PC sampler.
 
 ---
 
