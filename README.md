@@ -10,7 +10,7 @@ Score-based generative model over paired (ECG waveform, clinical report embeddin
 
 The model jointly fits a **conditional generative distribution** over ECG waveforms and clinical text embeddings:
 
-$$p_\theta\left(\mathbf{x},\, \mathbf{y} \;\middle|\; \ell\right)$$
+$$p_\theta\left(\mathbf{x}, \mathbf{y} \middle| \ell\right)$$
 
 where:
 
@@ -20,7 +20,7 @@ where:
 | $\mathbf{y} \in \mathbb{R}^{768}$ | BioClinicalBERT [CLS] token embedding of the paired clinical report |
 | $\ell \in \{0,\ldots,11\}$ | Lead identity (which of the 12 ECG leads is being modelled) |
 
-The full PTB-XL dataset contains ~21 K recordings; the training split (~17 K recordings, 12 leads each) yields **~209 K training samples**. The model learns a shared score function across all leads, distinguished by the lead embedding $\ell$.
+The full PTB-XL dataset contains ~21 K recordings the training split (~17 K recordings, 12 leads each) yields **~209 K training samples**. The model learns a shared score function across all leads, distinguished by the lead embedding $\ell$.
 
 ---
 
@@ -30,17 +30,17 @@ The full PTB-XL dataset contains ~21 K recordings; the training split (~17 K rec
 
 Both modalities share a **Variance-Preserving SDE** (VP-SDE) with linear noise schedule:
 
-$$\beta(t) = \beta_{\min} + t\,(\beta_{\max} - \beta_{\min}), \qquad t \in [0, T]$$
+$$\beta(t) = \beta_{\min} + t(\beta_{\max} - \beta_{\min}), \qquad t \in [0, T]$$
 
 The marginal distribution at time $t$ given clean data $\mathbf{x}_0$ is:
 
-$$p(\mathbf{x}_t \mid \mathbf{x}_0) = \mathcal{N}\left(\alpha(t)\,\mathbf{x}_0,\; \sigma(t)^2 \mathbf{I}\right)$$
+$$p(\mathbf{x}_t \mid \mathbf{x}_0) = \mathcal{N}\left(\alpha(t)\mathbf{x}_0, \sigma(t)^2 \mathbf{I}\right)$$
 
 where the signal and noise scales are:
 
-$$\alpha(t) = \exp\left(-\frac{1}{2}\int_0^t \beta(s)\,ds\right), \qquad \sigma(t) = \sqrt{1 - \alpha(t)^2}$$
+$$\alpha(t) = \exp\left(-\frac{1}{2}\int_0^t \beta(s)ds\right), \qquad \sigma(t) = \sqrt{1 - \alpha(t)^2}$$
 
-Parameters: $\beta_{\min} = 0.1$, $\beta_{\max} = 1.0$ (following GDSS; higher values create excessively noisy DSM targets). The same schedule is applied independently to $\mathbf{x}$ (ECG) and $\mathbf{y}$ (text embedding), yielding noisy pairs $(\mathbf{x}_t, \mathbf{y}_t)$ at each diffusion time $t$.
+Parameters: $\beta_{\min} = 0.1$, $\beta_{\max} = 1.0$ (following GDSS higher values create excessively noisy DSM targets). The same schedule is applied independently to $\mathbf{x}$ (ECG) and $\mathbf{y}$ (text embedding), yielding noisy pairs $(\mathbf{x}_t, \mathbf{y}_t)$ at each diffusion time $t$.
 
 ---
 
@@ -55,18 +55,18 @@ where $d = 128$ (timestep dim):
 | Component | Description |
 |-----------|-------------|
 | $\mathbf{e}_t = \mathrm{SinEmbed}(t) \in \mathbb{R}^d$ | Sinusoidal timestep embedding (Ho et al., 2020) |
-| $\phi(\mathbf{y}_t) = \mathrm{SiLU}(W_\phi\,\mathbf{y}_t) \in \mathbb{R}^d$ | Linear projection of noisy text embedding |
-| $\psi(\ell) = \mathrm{SiLU}(W_\psi\,\mathrm{Embed}(\ell)) \in \mathbb{R}^d$ | Lead identity embedding (nn.Embedding(12, 64) → Linear → SiLU) |
+| $\phi(\mathbf{y}_t) = \mathrm{SiLU}(W_\phi\mathbf{y}_t) \in \mathbb{R}^d$ | Linear projection of noisy text embedding |
+| $\psi(\ell) = \mathrm{SiLU}(W_\psi\mathrm{Embed}(\ell)) \in \mathbb{R}^d$ | Lead identity embedding (nn.Embedding(12, 64) → Linear → SiLU) |
 
 This vector is consumed by **FiLM** (Feature-wise Linear Modulation) at every residual block:
 
-$$\mathrm{FiLM}(\mathbf{h},\, \mathbf{c}) = \gamma(\mathbf{c}) \odot \mathbf{h} + \beta(\mathbf{c})$$
+$$\mathrm{FiLM}(\mathbf{h}, \mathbf{c}) = \gamma(\mathbf{c}) \odot \mathbf{h} + \beta(\mathbf{c})$$
 
 where $\gamma, \beta$ are produced by a 2-layer MLP with zero-initialised output, so all blocks start as identity maps at initialisation.
 
 **Classifier-free guidance (CFG)** drops the lead identity $\ell$ during training (probability $p_\ell = 0.10$), replacing it with a null sentinel so the model simultaneously learns the conditional and unconditional scores. At inference:
 
-$$\tilde{s}_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) = (1 + w)\,s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) - w\,s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \varnothing)$$
+$$\tilde{s}_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) = (1 + w)s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) - ws_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \varnothing)$$
 
 with guidance scale $w = 1.5$.
 
@@ -85,7 +85,7 @@ with guidance scale $w = 1.5$.
 | Decoder levels | skip-connected, stride-2 transpose conv + **self-attention at each level** |
 | Output conv | 128→1, k=1 |
 
-**Pretraining** (15 K steps, lr=1e-3, OneCycleLR): ECGUNet is first trained as a pure autoencoder with reconstruction loss $\mathcal{L}_{\mathrm{pre}} = \mathcal{L}_{\mathrm{MSE}} + \lambda_{\mathrm{spec}}\,\mathcal{L}_{\mathrm{FFT}}$, where $\mathcal{L}_{\mathrm{FFT}}$ is MSE over normalised FFT magnitudes. This builds in ECG morphology — QRS complexes, 1/f PSD, baseline wander — before any diffusion training.
+**Pretraining** (15 K steps, lr=1e-3, OneCycleLR): ECGUNet is first trained as a pure autoencoder with reconstruction loss $\mathcal{L}_{\mathrm{pre}} = \mathcal{L}_{\mathrm{MSE}} + \lambda_{\mathrm{spec}}\mathcal{L}_{\mathrm{FFT}}$, where $\mathcal{L}_{\mathrm{FFT}}$ is MSE over normalised FFT magnitudes. This builds in ECG morphology — QRS complexes, 1/f PSD, baseline wander — before any diffusion training.
 
 The bottleneck also serves as an ECG context extractor: `encode()` returns an L2-normalised mean-pooled vector passed to $s_\phi$.
 
@@ -99,9 +99,9 @@ $$\mathbf{h}_\theta(\mathbf{x}_t, t, \ell) = \mathrm{L2Norm}\left(\mathrm{MeanPo
 
 The text score is then:
 
-$$s_\phi(\mathbf{y}_t, \mathbf{h}_\theta, t) = \mathrm{MLP}_\phi\left(\mathbf{y}_t;\; \bigl[\mathbf{e}_t \;\|\; \mathrm{SiLU}(W_{\mathrm{ecg}}\,\mathbf{h}_\theta)\bigr]\right)$$
+$$s_\phi(\mathbf{y}_t, \mathbf{h}_\theta, t) = \mathrm{MLP}_\phi\left(\mathbf{y}_t, [\mathbf{e}_t \Vert \mathrm{SiLU}(W_{\mathrm{ecg}}\mathbf{h}_\theta)]\right)$$
 
-FiLM conditioning with $(t,\, \mathbf{h}_\theta)$ applied at every residual layer.
+FiLM conditioning with $(t, \mathbf{h}_\theta)$ applied at every residual layer.
 
 **End-to-end alignment gradients**: the ECG representation $\mathbf{h}_\theta$ is computed within the joint backward pass (no `detach`), so $s_\phi$'s text alignment loss trains $s_\theta$'s encoder to produce alignment-useful representations, not just ECG-denoising-useful ones.
 
@@ -111,17 +111,17 @@ FiLM conditioning with $(t,\, \mathbf{h}_\theta)$ applied at every residual laye
 
 Joint **denoising score matching (DSM)** with min-SNR-5 likelihood weighting $w(t)$:
 
-$$\mathcal{L} = \mathbb{E}_{t,\,\mathbf{x}_0,\,\mathbf{y}_0,\,\boldsymbol{\epsilon}}\left[w(t)\left(\left\|s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) + \frac{\boldsymbol{\epsilon}_1}{\sigma(t)}\right\|^2 + \left\|s_\phi(\mathbf{y}_t, \mathbf{h}_\theta, t) + \frac{\boldsymbol{\epsilon}_2}{\sigma(t)}\right\|^2\right)\right]$$
+$$\mathcal{L} = \mathbb{E}_{t,\mathbf{x}_0,\mathbf{y}_0,\boldsymbol{\epsilon}}\left[w(t)\left(\left\|s_\theta(\mathbf{x}_t, \mathbf{y}_t, t, \ell) + \frac{\boldsymbol{\epsilon}_1}{\sigma(t)}\right\|^2 + \left\|s_\phi(\mathbf{y}_t, \mathbf{h}_\theta, t) + \frac{\boldsymbol{\epsilon}_2}{\sigma(t)}\right\|^2\right)\right]$$
 
 The min-SNR-5 weight (Hang et al., 2023) balances the loss across diffusion times:
 
-$$w(t) = \sigma(t)^2 \cdot \min\left(\mathrm{SNR}(t),\; 5\right), \qquad \mathrm{SNR}(t) = \frac{\alpha(t)^2}{\sigma(t)^2}$$
+$$w(t) = \sigma(t)^2 \cdot \min\left(\mathrm{SNR}(t),\ 5\right), \qquad \mathrm{SNR}(t) = \frac{\alpha(t)^2}{\sigma(t)^2}$$
 
 This prevents the loss from blowing up at small $t$ (where $\sigma(t) \to 0$) and downweights noisy large-$t$ samples, focusing capacity on the intermediate regime where ECG structure is learnable.
 
 **Loss spike guard**: Rare bfloat16 instability spikes are absorbed before the backward pass:
 
-$$\mathcal{L}_{\mathrm{clipped}} = \mathrm{clamp}(\mathcal{L},\; \max=50) \cdot \mathbf{1}[\mathcal{L} \neq \mathrm{NaN}]$$
+$$\mathcal{L}_{\mathrm{clipped}} = \mathrm{clamp}(\mathcal{L},\ \max=50) \cdot \mathbf{1}[\mathcal{L} \neq \mathrm{NaN}]$$
 
 **Gradient accumulation**: gradients are accumulated over 4 micro-batches (effective batch size 1024) to reduce DSM loss variance without exceeding GPU memory.
 
@@ -148,7 +148,7 @@ The symmetric arrangement reduces the local operator splitting error from $\math
 > Wagner, P., Strodthoff, N., Bousseljot, R., Kreiseler, D., Lunze, F. I., Samek, W., & Schaeffter, T. (2020). *PTB-XL, a large publicly available electrocardiography dataset.* Scientific Data, 7(1), 154. [PhysioNet](https://physionet.org/content/ptb-xl/1.0.3/)
 
 - **21,837 records**, 10 seconds each, 12 leads at 100 Hz (1000 samples/lead)
-- Clinical reports originally in German; translated to English via Anthropic Batch API (stored as `report_en` column)
+- Clinical reports originally in German translated to English via Anthropic Batch API (stored as `report_en` column)
 - Contaminated API responses (refusals, preambles) are automatically filtered from both the CSV and embedding cache
 - Stratified 10-fold cross-validation splits: folds 1–8 train, fold 9 val, fold 10 test
 - Multi-lead training expands each recording to 12 samples → **~209 K train samples**
@@ -167,7 +167,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv --python 3.13 && source .venv/bin/activate
 uv pip install -e ".[dev]"
 
-# momentfm pins old transformers/huggingface_hub; install without its deps
+# momentfm pins old transformers/huggingface_hub install without its deps
 uv pip install momentfm --no-deps
 ```
 
@@ -196,7 +196,7 @@ sbatch scripts/fetch_data.sh
 The pipeline:
 1. Download PTB-XL from Kaggle → extract to `--data-dir`
 2. Submit all non-empty reports to the Anthropic Batch API for normalisation (Claude detects language and translates German → English)
-3. Filter contaminated API responses; write `report_en` column to CSV
+3. Filter contaminated API responses write `report_en` column to CSV
 4. Compute per-lead signal statistics
 5. Cache BioClinicalBERT embeddings to `--cache-dir`
 
@@ -216,7 +216,7 @@ sbatch scripts/pretrain.sh
 
 # Step 2: joint DSM fine-tune from pretrained weights (100 K steps)
 sbatch scripts/train.sh
-# pretrain_final.pt is detected automatically; pass --pretrain-checkpoint to override
+# pretrain_final.pt is detected automatically pass --pretrain-checkpoint to override
 ```
 
 Config values can be overridden on the command line:
