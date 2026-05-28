@@ -50,13 +50,19 @@ Every residual block in $s_\theta$ receives a shared conditioning vector $\mathb
 
 $$\mathbf{c} = \begin{bmatrix} \mathbf{e}_t \\ \phi(\mathbf{y}_t) \\ \psi(\ell) \end{bmatrix} \in \mathbb{R}^{3d}$$
 
-where $d = 128$ (timestep dim):
+where $d = 128$ (timestep dim) and the three components are:
+
+$$\mathbf{e}_t = \mathrm{SinEmbed}(t) \in \mathbb{R}^d$$
+
+$$\phi(\mathbf{y}_t) = \mathrm{SiLU}(W_\phi\mathbf{y}_t) \in \mathbb{R}^d$$
+
+$$\psi(\ell) = \mathrm{SiLU}(W_\psi\mathrm{Embed}(\ell)) \in \mathbb{R}^d$$
 
 | Component | Description |
 |-----------|-------------|
-| $\mathbf{e}_t = \mathrm{SinEmbed}(t) \in \mathbb{R}^d$ | Sinusoidal timestep embedding (Ho et al., 2020) |
-| $\phi(\mathbf{y}_t) = \mathrm{SiLU}(W_\phi\mathbf{y}_t) \in \mathbb{R}^d$ | Linear projection of noisy text embedding |
-| $\psi(\ell) = \mathrm{SiLU}(W_\psi\mathrm{Embed}(\ell)) \in \mathbb{R}^d$ | Lead identity embedding (nn.Embedding(12, 64) → Linear → SiLU) |
+| $\mathbf{e}_t$ | Sinusoidal timestep embedding (Ho et al., 2020) |
+| $\phi(\mathbf{y}_t)$ | Linear projection of noisy text embedding |
+| $\psi(\ell)$ | Lead identity embedding (nn.Embedding(12, 64) → Linear → SiLU) |
 
 This vector is consumed by **FiLM** (Feature-wise Linear Modulation) at every residual block:
 
